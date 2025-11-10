@@ -2537,6 +2537,7 @@ plot_forecast
 
 # 2. Gráfico de los componentes del modelo
 # Esto te mostrará la tendencia, la estacionalidad anual, etc.
+plot_forecast_comp <- prophet_plot_components(model, forecast)
 plot_forecast_comp
 ```
 
@@ -2603,6 +2604,7 @@ p_main <- plotly::ggplotly(p_main)
 p_main
 # 2. Gráfico de los componentes del modelo
 # Ahora verás una estacionalidad "semanal" (weekly) además de la anual
+p_comp <- prophet_plot_components(model_temp_diario, forecast_temp_diario)
 p_comp
 ```
 
@@ -2767,9 +2769,12 @@ set(df, j = "datetime",
     value = as.POSIXct(paste(df[["fecha"]], sprintf("%02d:00:00", df[["hora"]])),
                        tz = "America/Argentina/Buenos_Aires"))
 
-.save_rds(df, "data/df_clean")
-.save_rds(daily_station, "data/daily_station")
-.save_rds(monthly_by_station, "data/monthly_by_station")
+if (!dir.exists("data")) {
+  dir.create("data")
+}
+saveRDS(df, "data/df_clean")
+saveRDS(daily_station, "data/daily_station")
+saveRDS(monthly_by_station_fair, "data/monthly_by_station")
 
 # --- 1) GDD mensual (base 10°C) ----------------------------------------------
 gdd_daily <- df[!is.na(temp),
@@ -2778,7 +2783,7 @@ gdd_daily <- df[!is.na(temp),
 gdd_month <- gdd_daily[, .(gdd_m = sum(gdd)),
                        by = .(nro, ym = as.Date(format(ymd, "%Y-%m-01")))]
 
-.save_rds(gdd_month, "data/gdd_month")
+saveRDS(gdd_month, "data/gdd_month")
 
 # --- 2) Join de estaciones (Nro -> Nombre) -----------------------------------
 suppressPackageStartupMessages({
@@ -2812,7 +2817,7 @@ gdd_month_joined <- merge(
 )
 
 # --- 3) Preparar monthly_by_station (tiene nombre, ds, y) --------------------
-monthly_by_station <- as.data.table(monthly_by_station)
+monthly_by_station <- as.data.table(monthly_by_station_fair)
 setnames(monthly_by_station, make_clean_names(names(monthly_by_station)))  # nombre, ds, y
 
 # Validaciones mínimas
@@ -2842,26 +2847,27 @@ gdd_by_nombre <- gdd_month_joined[!is.na(nombre_ref) & !is.na(ym),
                                   by = .(nombre = nombre_ref, ym)]
 
 # --- 5) Features integradas: merge por nombre + ym ---------------------------
+gdd_month_joined <- unique(gdd_month_joined, by = "nro")
+monthly_by_station <- unique(monthly_by_station, by = "nro")
 feat_month <- merge(
   monthly_by_station,
-  gdd_by_nombre,
-  by = c("nombre","ym"),
+  gdd_month_joined,
+  by = "nro",
   all.x = TRUE
 )
-
 # Orden sugerido si esas columnas existen
 cols_target <- c("nombre","ym","y","ds","gdd_m","latitud","longitud","provincia",
                  "temp_m","hum_m","ff_m","pnm_m","pp_m","ndays")
 setcolorder(feat_month, c(intersect(cols_target, names(feat_month)),
                           setdiff(names(feat_month), cols_target)))
 
-.save_rds(feat_month, "data/feat_month")
+saveRDS(feat_month, "data/feat_month")
 
 # --- 6) Choices básicos para la app ------------------------------------------
 estaciones <- sort(unique(na.omit(feat_month$nombre)))
 anios      <- sort(unique(year(feat_month$ym)))  # años presentes en los datos mensuales
-.save_rds(estaciones, "data/estaciones")
-.save_rds(anios,      "data/anios")
+saveRDS(estaciones, "data/estaciones")
+saveRDS(anios,      "data/anios")
 
 message("=== Listo. Merge por nombre + ym; sin requerir nro en monthly_by_station ===")
 
