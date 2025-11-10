@@ -1,0 +1,2898 @@
+---
+title: "EDA: Datos metereológicos por estaciones"
+output: html_notebook
+---
+# Introducción
+Este documento presenta un Análisis Exploratorio de Datos (EDA) sobre un conjunto de datos meteorológicos horarios de múltiples estaciones en Argentina. El objetivo es limpiar, procesar y transformar los datos brutos para descubrir patrones, analizar tendencias temporales y geoespaciales, e identificar eventos extremos.
+
+El análisis comienza con una fase de ingesta y limpieza de datos, seguida de la ingeniería de variables (como la desagregación de precipitación y la categorización de vientos), y concluye con una serie de visualizaciones interactivas y un modelado predictivo básico
+
+# 1. Configuración e Ingesta de Datos
+
+Primero, cargamos todas las librerías necesarias para el análisis, incluyendo tidyverse para la manipulación de datos, leaflet para mapas, y prophet para series temporales.
+```{r}
+rm(list = ls())
+options(scipen=999)
+
+library(tidyverse)
+library(slider)
+library("rstudioapi")
+library(arrow)
+library(zoo)
+library(data.table)
+library(janitor)
+library(leaflet)
+library(scales)
+library(prophet)
+library(htmlwidgets)
+library(plotly)
+library(viridisLite)
+library(png)
+if (!requireNamespace("openair", quietly = TRUE)) {
+  install.packages("openair", dependencies = TRUE)
+}
+library(openair)
+library(base64enc)
+library(tibble)   
+library(RColorBrewer)
+library(stringi)
+
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+No tenemos el dataset completo. Hay que armarlo. Primero empezamos uniendo los archivos de texto, que estan separado por espacios tabulados. Identificamos cada columna con expresiones regulares.  Luego, convertimos las columnas de texto a sus tipos de datos correctos (numérico, fecha) y guardamos el resultado en dataset_clima_unificado.Rds para no tener que repetir este costoso proceso.
+
+```{r}
+# -----------------------------------------------------------------
+# PASO 2: Definir la ubicación de tus archivos
+# -----------------------------------------------------------------
+# Usa "." si ya estableciste el directorio de trabajo (recomendado)
+ruta_carpeta <- "C:/Users/tomas/Desktop/universidad/Ciencia de Datos/programación ii - R/TP 2/smn-data"
+
+# -----------------------------------------------------------------
+# PASO 3: La función de procesamiento (REGEX HIPER-REFINADO)
+# -----------------------------------------------------------------
+procesar_archivo_regex_general <- function(ruta_archivo) {
+  
+  print(paste("Procesando:", ruta_archivo)) # Progreso
+  
+  tryCatch({
+    
+    # --- 1. Leer líneas (latin1) ---
+    lineas <- readr::read_lines( ruta_archivo, skip_empty_rows = TRUE, locale = locale(encoding = "latin1") )
+    
+    # --- 2. Omitir archivos vacíos / solo encabezado ---
+    if (is.null(lineas) || length(lineas) <= 2) { return(NULL) }
+    lineas_datos_raw <- lineas[-(1:2)]
+    if (length(lineas_datos_raw) == 0) { return(NULL) }
+    
+    # --- 3. Lógica de "Cosido" ---
+    lineas_cosidas <- c(); buffer_linea <- ""
+    for (linea_actual in lineas_datos_raw) {
+      if (nchar(trimws(linea_actual)) == 0) { next }
+      if (stringr::str_starts(trimws(linea_actual), "^\\d{8}")) {
+        if (nchar(buffer_linea) > 0) { lineas_cosidas <- c(lineas_cosidas, buffer_linea) }
+        buffer_linea <- linea_actual
+      } else { buffer_linea <- paste0(buffer_linea, linea_actual) }
+    }
+    if (nchar(buffer_linea) > 0) { lineas_cosidas <- c(lineas_cosidas, buffer_linea) }
+    
+    # --- 4. Extracción con Expresiones Regulares (HIPER-REFINADO) ---
+    # Patrón más específico basado en tipos de datos esperados:
+    patron_especifico <- paste0(
+      "^",                # Inicio de línea
+      "(\\d{8})",         # Grupo 1: FECHA (8 dígitos exactos)
+      "\\s+",             # Separador
+      "(\\d+|\\s{1,})",   # Grupo 2: HORA (números O espacios)
+      "\\s+",             # Separador
+      "([-+]?\\d*\\.?\\d+|\\s{1,})", # Grupo 3: TEMP (número con decimal opcional O espacios)
+      "\\s+",             # Separador
+      "(\\d+|\\s{1,})",   # Grupo 4: HUM (números O espacios)
+      "\\s+",             # Separador
+      # Grupo 5: PNM (número con decimal opcional O AL MENOS DOS espacios)
+      "([-+]?\\d+\\.\\d+|\\s{2,})",
+      "\\s+",             # Separador
+      "(\\d+|\\s{1,})",   # Grupo 6: DD (SOLO números O espacios)
+      "\\s+",             # Separador
+      "(\\d+|\\s{1,})",   # Grupo 7: FF (SOLO números O espacios)
+      "\\s+",             # Separador
+      "(.*?)",            # Grupo 8: NOMBRE (el resto, no goloso)
+      "\\s*$"             # Espacios opcionales al final
+    )
+    
+    matches <- str_match(lineas_cosidas, patron_especifico)
+    
+    # Verificación
+    if (is.null(matches) || ncol(matches) != 9 || all(is.na(matches[,2]))) {
+      warning(paste("Regex específico falló en:", ruta_archivo, "- Omitiendo."))
+      # Podríamos añadir un fallback aquí si fuera necesario, pero confiemos en este patrón
+      return(NULL)
+    }
+    
+    # Convertir a data frame
+    datos_extraidos <- as.data.frame(matches[, -1, drop = FALSE], stringsAsFactors = FALSE)
+    colnames(datos_extraidos) <- c("FECHA", "HORA", "TEMP", "HUM", "PNM", "DD", "FF", "NOMBRE")
+    datos_extraidos <- datos_extraidos %>% mutate(across(everything(), trimws))
+    
+    return(datos_extraidos) # Devolver datos como texto
+    
+  }, error = function(e) {
+    warning(paste("Error GRAVE procesando con Regex:", ruta_archivo, "-", e$message))
+    return(NULL)
+  })
+}
+# -----------------------------------------------------------------
+# PASO 5: Ejecutar el proceso y combinar todo
+# -----------------------------------------------------------------
+
+# 1. Obtener la lista de los archivos .txt
+archivos <- list.files(path = ruta_carpeta,
+                       pattern = "\\.txt$",
+                       full.names = TRUE,
+                       ignore.case = TRUE)
+
+print(paste("Se encontraron", length(archivos), "archivos para importar."))
+
+# 2. Aplicar la función CORRECTA a todos los archivos
+#    ¡ASEGÚRATE de que el nombre aquí coincida con el de la función!
+dataset_temporal <- purrr::map_dfr(archivos,
+                                   procesar_archivo_regex_general,
+                                   .id = "archivo_origen")
+
+print("Importación (como texto) completada.")
+
+# -----------------------------------------------------------------
+# PASO 6: Convertir columnas al tipo de dato correcto
+# -----------------------------------------------------------------
+print("Convirtiendo tipos de datos...")
+
+dataset_completo <- dataset_temporal %>%
+  # Primero, reemplazar cadenas vacías "" o que solo sean espacios con NA
+  mutate(across(everything(), ~na_if(trimws(.), ""))) %>%
+  mutate(
+    # Convertir las columnas numéricas
+    across(
+      .cols = c(HORA, TEMP, HUM, PNM, DD, FF),
+      .fns = as.numeric # Convierte a número, los NA se mantienen
+    ),
+    
+    # Convertir la FECHA
+    FECHA = as.Date(FECHA, format = "%d%m%Y")
+    
+    # NOMBRE ya fue limpiado con trimws dentro de la función y con na_if arriba
+  )
+
+print("¡Conversión de datos completada!")
+
+# -----------------------------------------------------------------
+# PASO 7: Revisar el dataset final
+# -----------------------------------------------------------------
+
+print(paste("Total de filas importadas:", nrow(dataset_completo)))
+
+print("Revisando las primeras 10 filas del dataset final:")
+print(head(dataset_completo, 10))
+
+print("Revisando la estructura final:")
+str(dataset_completo)
+
+print("Revisando un resumen estadístico básico:")
+summary(dataset_completo)
+
+# -----------------------------------------------------------------
+# PASO 8: Guardar el dataset final 💾
+# -----------------------------------------------------------------
+print("Guardando el dataset unificado en 'dataset_clima_unificado.Rds'...")
+
+saveRDS(dataset_completo, file = "dataset_clima_unificado.Rds")
+
+print("¡Dataset guardado con éxito! La próxima vez, solo usa readRDS('dataset_clima_unificado.Rds').")
+
+readr::write_csv(dataset_completo, "dataset_clima_unificado.csv")
+```
+
+Primer checkpoint: Para no ejecutar todo lo de arriba
+```{r}
+dataset_completo <- openRDS("dataset_clima_unificado.Rds")
+```
+
+# 2. Limpieza de Datos y Tratamiento de NAs
+Un primer resumen y conteo de valores NA revela que, aunque los datos están leídos, no están limpios. Múltiples columnas tienen una alta proporción de valores faltantes o anómalos que debemos tratar.
+```{r}
+dataset_met <- dataset_completo
+
+summary(dataset_met)
+# proporción de valores NA para estas columnas
+attach(dataset_met) # adjuntando para evitar mencionar df$var cada vez
+
+col1 = c() 
+col2 = c()
+col3 = c()
+
+# bucle 
+for (i in (1:dim(dataset_met)[2])){
+  col1[i] = colnames(dataset_met)[i]
+  col2[i] =  sum(is.na(dataset_met[i]))
+  col3[i] = round(col2[i]/dim(dataset_met)[1],4)
+}
+
+# creando un dataframe para compilar los valores NA 
+(df_NA <- tibble("Columna" = col1, "Valores_NA" = col2, "Proporcion_NA" = col3))
+
+```
+
+## 2.1. Limpieza de Temperatura (TEMP)
+
+Comenzamos con la Temperatura. Un histograma nos muestra que la mayoría de los datos se concentran en un rango lógico, pero existen valores atípicos extremos (ej. > 50°C o < -40°C) que son físicamente imposibles.
+
+Filtramos estos valores, convirtiéndolos en NA.
+
+```{r}
+tibble(dataset_met)
+summary(dataset_met)
+
+ggplot(dataset_met, aes(x = TEMP)) +
+  geom_histogram(binwidth = 0.5) +
+  coord_cartesian(xlim = c(-100, 100), ylim = c(0, 1)) +
+  labs(
+    title = "La temperatura se concentra aproximadamente entre los -40 y 50 grados",
+    subtitle = "Todos los demás valores deben ser erróneos"
+  )
+
+# Ponemos NA donde la temperatura sea otra que ese intervalo
+
+met_limpio <- dataset_met |>
+  mutate(
+    TEMP = case_when(
+      TEMP > -40 & TEMP < 50 ~ TEMP #Si esta entre esos valores es la misma temperatura, sino pone NA
+    )
+  )
+```
+
+Esto incrementa nuestros NA en Temperatura, por lo que debemos imputarlos. Nuestra estrategia es iterativa y se basa en promedios móviles:
+- Primero, intentamos un promedio móvil de 5 días (2 días antes, 2 después) agrupando por estación y hora.
+- Probamos una segunda imputación con un promedio móvil de 5 horas (2 horas antes, 2 después) agrupando por estación y día.
+- Esto reduce los NA a uno solo. Inspeccionamos este caso (en OBERA) y vemos que es un registro aislado para ese día, por lo que lo eliminamos.
+```{r}
+summary(met_limpio) # Ahora la minima es de -39.9 y la maxima de 45.60
+
+# Pero no queremos que haya NA. ¿Cómo podemos aproximar a la temperatura de ese día? Hacemos el promedio de dos horas atras y dos horas adelante.
+
+met_limpio_1.2 <- met_limpio |>
+  arrange(NOMBRE, FECHA) |> #Me doy cuenta que el NOMBRE en las primeras 120 filas son un número (28) o una fecha, que ni siquiera corresponde a la fecha real. Quizas podriamos comparar con el dia anterior a ver que estaciones hay en una y no en la otra pero, al ser tan pocas, prefiero borrarlas.
+  slice(-(1:120))
+
+na_temp <- met_limpio_1.2 |>
+  filter(is.na(TEMP)) |>
+  group_by(FECHA, NOMBRE) |>
+  summarise(n = n()) |>
+  arrange(desc(n)) 
+na_temp
+# Hay mas de uno por día por estacion. Es más, hay un dia en una estacion que tiene NA en 22 registros. Cambio de planes: Hacemos de dos dias atras y dos dias adelante en esa misma hora. En los valores que vuelva a haber NA hacemos dos horas atras y dos adelante
+
+# --- Preparación ---
+
+met_iterativo <- met_limpio_1.2
+
+# Obtenemos el conteo inicial de NAs
+previous_na_count <- sum(is.na(met_iterativo$TEMP))
+
+cat("Conteo inicial de NAs:", previous_na_count, "\n")
+
+while (TRUE) {
+  met_iterativo <- met_iterativo |>
+    group_by(NOMBRE, HORA) |>
+    arrange(FECHA, .by_group = TRUE) |>
+    mutate(
+    temp_promedio_movil = slide_dbl(
+      TEMP, 
+      ~mean(.x, na.rm = TRUE), 
+      .before = 2, 
+      .after = 2
+    ),
+    TEMP = if_else(is.na(TEMP), temp_promedio_movil, TEMP)
+  ) |>
+  ungroup() |>
+    select(-temp_promedio_movil) 
+
+  # 4. Calculamos el nuevo conteo de NAs
+  new_na_count <- sum(is.na(met_iterativo$TEMP))
+  
+  cat("Iteración completada. NAs restantes:", new_na_count, "\n")
+
+  # 5. Condición de salida
+  if (new_na_count < previous_na_count) {
+    previous_na_count <- new_na_count
+  } else {
+    cat("Estabilizado. No hubo más reducción de NAs. Saliendo del bucle.\n")
+    break # ¡Salimos del while!
+  }
+}
+
+summary(met_iterativo) # 29 NAs restantes
+
+# Probamos con otra lógica. Promedio de una hora antes y una después
+
+previous_na_count <- sum(is.na(met_iterativo$TEMP))
+
+cat("Conteo inicial de NAs:", previous_na_count, "\n")
+
+met_iterativo <- met_iterativo |>
+    group_by(NOMBRE, FECHA) |>
+    arrange(HORA, .by_group = TRUE) |>
+    mutate(
+    temp_promedio_movil = slide_dbl(
+      TEMP, 
+      ~mean(.x, na.rm = TRUE), 
+      .before = 2, 
+      .after = 2
+    ),
+    TEMP = if_else(is.na(TEMP), temp_promedio_movil, TEMP)
+  ) |>
+  ungroup() |>
+    select(-temp_promedio_movil) 
+  
+new_na_count <- sum(is.na(met_iterativo$TEMP))
+  
+cat("Iteración completada. NAs restantes:", new_na_count, "\n")
+# Queda un solo NA, Lo visualizamos
+
+met_iterativo |> 
+  arrange(desc(is.na(TEMP)), FECHA)
+# Es en OBERA, 2022-09-18
+
+met_iterativo |>
+  filter(NOMBRE == "OBERA",
+         FECHA == "2022-09-18")
+# Solo hay un registro de Obera ese dia. EN las otras columnas tambien tiene NA. Lo eliminamos.
+
+met_limpio_1.4 <- met_iterativo |>
+  arrange(desc(is.na(TEMP)), FECHA) |>
+  slice(-1)
+summary(met_limpio_1.4)
+```
+
+Tras limpiar la temperatura, guardamos el progreso.
+```{r}
+saveRDS(met_limpio_1.4, file = "met_limpio_1.4.Rds")
+```
+
+## 2.2. Limpieza de Humedad (HUM)
+
+Corregimos exitosamente todos los NA de temperatura. Ahora analizamos la humedad.Un histograma muestra valores fuera del rango físico (0-100%). Los filtramos, convirtiéndolos en NA.
+
+```{r}
+ggplot(met_limpio_1.4, aes(x = HUM)) +
+  geom_histogram(binwidth = 0.5)
+# Como es de esperar, la mayoria de valores estan entre el 0 y el 100. Como no puede haber mas de 100% d ehumedad los otros son NA.
+
+met_limpio_2.1 <- met_limpio_1.4 |>
+  mutate(
+    HUM = case_when(
+      HUM >= 0 & HUM <= 100 ~ HUM #Si esta entre esos valores es la misma temperatura, sino pone NA
+    )
+  )
+summary(met_limpio_2.1)
+```
+
+Estimaremos los valores de humedad que no tenemos con una hora antes y una hora después, ya que es más volátil que la temperatura.
+
+Implementamos un bucle while que aplica un promedio móvil de 3 horas (1 antes, 1 después) agrupado por estación y día, repitiendo hasta que el número de NA se estabilice.
+```{r}
+met_limpio_2.2 <- met_limpio_2.1
+previous_na_count <- sum(is.na(met_limpio_2.2$HUM))
+
+cat("Conteo inicial de NAs:", previous_na_count, "\n")
+
+while (TRUE) {
+  met_limpio_2.2 <- met_limpio_2.2 |>
+    group_by(NOMBRE, FECHA) |>
+    arrange(HORA, .by_group = TRUE) |>
+    mutate(
+    hum_promedio_movil = slide_dbl(
+      HUM, 
+      ~mean(.x, na.rm = TRUE), 
+      .before = 1, 
+      .after = 1
+    ),
+    HUM = if_else(is.na(HUM), hum_promedio_movil, HUM)
+  ) |>
+  ungroup() |>
+    select(-hum_promedio_movil) 
+  
+  new_na_count <- sum(is.na(met_limpio_2.2$HUM))
+  
+  cat("Iteración completada. NAs restantes:", new_na_count, "\n")
+
+  if (new_na_count < previous_na_count) {
+    previous_na_count <- new_na_count
+  } else {
+    cat("Estabilizado. No hubo más reducción de NAs. Saliendo del bucle.\n")
+    break # ¡Salimos del while!
+  }
+}
+
+summary(met_limpio_2.2)
+ggplot(met_limpio_2.1, aes(x = HUM)) +
+  geom_histogram(binwidth = 0.5)
+ggplot(met_limpio_2.2, aes(x = HUM)) +
+  geom_histogram(binwidth = 0.5)
+```
+
+Guardamos el progreso nuevamente.
+```{r}
+saveRDS(met_limpio_2.2, file = "met_limpio_2.2.Rds")
+met_limpio_2.2 <- readRDS("met_limpio_2.2.Rds")
+```
+
+## 2.3. Limpieza de Presión (PNM)
+
+Vemos la distribución de Presión, que está medida en hPa.
+
+El histograma de Presión (PNM) es más complejo. Muestra la mayoría de los valores en el rango lógico (900-1050 hPa), pero también cúmulos extraños cerca de 1500 y 3000 hPa.
+
+Al investigar estos valores, descubrimos que se concentran en estaciones específicas (ej. "SALTA AERO"). Una serie temporal de Salta revela que todos sus datos de presión son anómalos, sugiriendo un sensor defectuoso.
+
+Decidimos filtrar todos los valores fuera del rango realista 900-1050 hPa, convirtiéndolos en NA.
+```{r}
+met_limpio_3 <- met_limpio_2.2
+
+met_limpio_3 |>
+  filter(NOMBRE == "LA QUIACA OBSERVATORIO") |>
+  view()
+  
+
+ggplot(met_limpio_3, aes(x = PNM)) +
+  geom_histogram(binwidth = 0.5)
+# Hay una especie de macha alrededor de los 1500hPa y poco más de 3000. Ampliamos
+ggplot(met_limpio_3, aes(x = PNM)) +
+  geom_histogram(binwidth = 0.5) + 
+  coord_cartesian(xlim = c(1375,1625))
+ggplot(met_limpio_3, aes(x = PNM)) +
+  geom_histogram(binwidth = 0.5) + 
+  coord_cartesian(xlim = c(3000,3200))
+# ¿Por qué será?
+
+valores_raros <- met_limpio_3 |>
+  filter(PNM > 1100 | PNM < 850) |>
+  arrange(PNM)
+
+valores_raros_count <- valores_raros |> 
+  count(NOMBRE) |> 
+  arrange(desc(n))
+# Salta es la estacion con mas valores raros
+
+presion_salta_diaria <- met_limpio_3 |>
+  filter(NOMBRE == "SALTA AERO") |>
+  group_by(FECHA) |>
+  summarise(
+    PRESION_media = mean(PNM, na.rm = TRUE)
+  ) |>
+  ungroup()
+
+# Graficar la serie de tiempo
+ggplot(presion_salta_diaria, aes(x = FECHA, y = PRESION_media)) +
+  geom_line() +
+  geom_point() + # Opcional: mostrar los puntos de cada día
+  labs(
+    title = "Evolución de la Presión Promedio en Bariloche",
+    y = "Presión Media Diaria (hPa)",
+    x = "Fecha"
+  ) +
+  theme_minimal()
+
+# Podemos ver que no hay un solo dato en Salta que esté en lo parámetros normales. Muy probablemente el sensor esté roto.
+
+met_limpio_3.1 <- met_limpio_3 |>
+  mutate(
+    PNM = if_else(
+      PNM > 900 & PNM < 1050, PNM, NA_real_)
+    )
+
+```
+
+Codigo borrado, pero en resumen: Se itero tantas veces que hubo sesgo de propagacion. La maxima cantidad de valores que se repetian por estacion era de 561 y pasó a 26876.
+
+Probamos otra estrategia. Usamos el paquete zoo para una imputación más controlada:
+- na.approx: Interpolación lineal para rellenar huecos pequeños (máx. 2 horas).
+- na.locf: "Última observación llevada adelante" (LOCF) para huecos de hasta 2 horas.
+- na.locf(fromLast = TRUE): "Próxima observación traída hacia atrás" (NOCB) para los huecos restantes.
+
+Este método rellena los NA de forma robusta sin distorsionar significativamente la distribución original.
+```{r}
+met_relleno_final <- met_limpio_3.1 |>
+  group_by(NOMBRE, FECHA) |>
+  arrange(HORA, .by_group = TRUE) |>
+  mutate(
+    PNM_relleno_final = zoo::na.approx(PNM, maxgap = 2, na.rm = FALSE),
+    PNM_relleno_final = zoo::na.locf(PNM_relleno_final, na.rm = FALSE, maxgap = 2),
+    PNM_relleno_final = zoo::na.locf(PNM_relleno_final, fromLast = TRUE, na.rm = FALSE, maxgap = 2)
+  ) |>
+  ungroup()
+
+nas_finales <- sum(is.na(met_relleno_final$PNM_relleno_final))
+cat("NAs iniciales:", sum(is.na(met_limpio_3.1$PNM)), "\n")
+cat("NAs finales restantes:", nas_finales, "\n")
+
+summary(met_relleno_final)
+ggplot(met_relleno_final, aes(x = PNM)) +
+  geom_histogram(binwidth = 0.5)
+ggplot(met_relleno_final, aes(x = PNM_relleno)) +
+  geom_histogram(binwidth = 0.5)
+ggplot(met_relleno_final, aes(x = PNM_relleno_final)) +
+  geom_histogram(binwidth = 0.5) 
+# El cambio en la distribucion es apenas perceptible. Me quedo con esta limpieza de NA
+```
+
+No aproximamos más NAs para que no haya sesgo de propagación. Formateamos y guardamos.
+
+```{r}
+met_limpio_3.2 <- met_relleno_final |>
+  select(-PNM) |>
+  rename(PNM = PNM_relleno_final)
+saveRDS(met_limpio_3.2, "met_limpio_3.2.Rds")
+met_limpio_3.2 <- readRDS("met_limpio_3.2.Rds")
+```
+
+
+# 3. Ingeniería de Variables: Viento (DD y FF)
+
+Ahora analizamos las variables de viento: Dirección (DD) y Velocidad (FF).
+El histograma de Dirección (DD) muestra picos anómalos en 0 y 990.
+- Encontramos que DD=0 casi siempre corresponde a FF=0 (Calma).
+- DD=990 es un valor centinela conocido que significa "Variable".
+
+Usamos esto para dos propósitos:
+- Crear una nueva variable categórica DD_categoria (Norte, Noreste, Calmo, Variable).
+- Limpiar la columna numérica DD: si FF=0, ponemos NA; si DD=990, ponemos NA.
+```{r}
+met_limpio_4 <- met_limpio_3.2
+summary(met_limpio_4)
+
+ggplot(met_limpio_4, aes(x = DD)) +
+  geom_histogram(binwidth = 0.5)
+
+DD_common <- met_limpio_4 |>
+  group_by(DD) |>
+  summarise(DD = mean(DD), n = n()) |>
+  arrange(desc(DD))
+
+# Primero: ¿Qué hacemos con grado = 0? ¿Es lo mismo que 360?
+
+met_limpio_4 |> 
+  filter(DD == 0) |>
+  count(FF) # Descubrimos que si el grado = 0 en casi todos los casos la velocidad tambien es 0. Decidimos poner NA en los casos donde FF = 0 porque en realidad nunca hubo direccion. Dejarlo en 0 rompera las estadisticas y los graficos. El otro gran pico anomalo esta en DD = 990. Esto es un valor sentinela en metereología. Puede significar NA, calmo o variable.
+
+met_limpio_4.1 <- met_limpio_4 |>
+  mutate(
+      DD_categoria = case_when(
+      FF == 0 ~ "Calmo",
+      DD == 990 ~ "Variable",
+      is.na(FF) ~ NA_character_,
+      (DD > 337.5 | DD <= 22.5) & FF > 0 ~ "Norte",
+      DD > 22.5  & DD <= 67.5  ~ "Noreste",
+      DD > 67.5  & DD <= 112.5 ~ "Este",
+      DD > 112.5 & DD <= 157.5 ~ "Sureste",
+      DD > 157.5 & DD <= 202.5 ~ "Sur",
+      DD > 202.5 & DD <= 247.5 ~ "Suroeste",
+      DD > 247.5 & DD <= 292.5 ~ "Oeste",
+      DD > 292.5 & DD <= 337.5 ~ "Noroeste",
+      .default = NA_character_
+    ),
+    DD = case_when(
+      FF == 0 ~ NA_real_,
+      DD == 0 & is.na(FF) ~ NA_real_,
+      DD == 0 & FF > 0 ~ 360,
+      DD > 360 ~ NA_real_,
+      .default = DD
+    ),
+    DD_categoria = factor(DD_categoria)
+  )
+summary(met_limpio_4.1) 
+```
+
+Un histograma de Velocidad del Viento (FF) muestra algunos valores muy altos. Al investigarlos, vemos que provienen de bases antárticas y son, de hecho, valores válidos.
+```{r}
+
+ggplot(met_limpio_4.1) +
+  geom_histogram(aes(x = FF))
+
+met_limpio_4.1 |>
+  filter(FF > 120) |>
+  group_by(NOMBRE) |>
+  summarize(n=n()) |>
+  arrange(desc(n))
+# No hay que filtrar nada. Los vientos fuertes son en bases antarticas
+```
+
+El próximo paso es unir el dataset con las estaciones. Hay algunas estaciones cuyos nombres están mal.
+
+Detectamos que muchas estaciones tienen nombres ligeramente diferentes (ej. "LA QUIACA OBS." vs "LA QUIACA OBSERVATORIO"). Estandarizamos estos nombres usando case_when para asegurar que las uniones futuras funcionen correctamente.
+
+```{r}
+met_limpio_4.2 <- met_limpio_4.1 |>
+  filter(NOMBRE != "}") |>
+  mutate(
+    NOMBRE = case_when(
+      NOMBRE == "BUENOS AIRES" ~ "BUENOS AIRES OBSERVATORIO",
+      NOMBRE == "ESC.AVIACION MILITAR AERO" ~ "ESCUELA DE AVIACION MILITAR AERO",
+      NOMBRE == "ESCUELA DE AVIACION MILITA                                                                      R AERO" ~ "ESCUELA DE AVIACION MILITAR AERO",
+      NOMBRE == "LA QUIACA OBS." ~ "LA QUIACA OBSERVATORIO",
+      NOMBRE == "LAS FLORES AERO" ~ "LAS FLORES",
+      NOMBRE == "OBERA AERO" ~ "OBERA",
+      NOMBRE == "PCIA. ROQUE SAENZ PEÑA AER O	" ~ "PRESIDENCIA ROQUE SAENZ PEÑA AERO",
+      NOMBRE == "PILAR OBS." ~ "PILAR OBSERVATORIO",
+      NOMBRE == "PCIA. ROQUE SAENZ PEÑA AER                                                                      O" ~ "PRESIDENCIA ROQUE SAENZ PEÑA AERO",
+      NOMBRE == "PRESIDENCIA ROQUE SAENZ PE                                                                      ÑA AERO" ~ "PRESIDENCIA ROQUE SAENZ PEÑA AERO",
+      NOMBRE == "SAN FERNANDO" ~ "SAN FERNANDO AERO",
+      NOMBRE == "VENADO TUERTO" ~ "VENADO TUERTO AERO",
+      NOMBRE == "VILLA DE MARIA DEL RIO SEC                                                                      O" ~ "VILLA DE MARIA DEL RIO SECO",
+      NOMBRE == "VILLA MARIA DEL RIO SECO" ~ "VILLA DE MARIA DEL RIO SECO",
+      .default = NOMBRE 
+    )
+  )
+
+met_limpio_4.2 |>
+  group_by(NOMBRE) |>
+  summarise(n = n()) |>
+  view()
+```
+
+Volvemos a analizar FF. Vamos a hacer una interpolacion para imputar NAs, con un gap muy corto de dos horas. Primero limpiamos un poco el DF (Volvemos a analizar FF. Vamos a hacer una interpolacion para imputar NAs, con un gap muy corto de dos horas.
+
+Realizamos una pasada final de limpieza:
+- Normalizamos los nombres de las columnas (ej. FECHA -> fecha) con janitor::clean_names.
+- Creamos una columna datetime formal.
+- Eliminamos registros duplicados (misma estación, fecha y hora).
+- Realizamos una imputación final y conservadora sobre ff (Velocidad del Viento) usando zoo::na.approx y na.locf solo para huecos de 2 horas o menos. columnas, creando datetime y eliminando duplicados) para ya tenerlo listo para los próximos analisis.
+```{r}
+met_limpio_4.3 <- met_limpio_4.2 |>
+  clean_names() |> #Normalizamos los nombres para el siguiente paso, que va a ser unir los dataframes
+  mutate(
+    fecha        = as.Date(fecha),
+    hora         = as.integer(hora),
+    dd_categoria = as.factor(dd_categoria),
+    pnm          = as.numeric(pnm),
+    # Agregamos columna Datetime
+    datetime = lubridate::make_datetime(
+      year = lubridate::year(fecha),
+      month = lubridate::month(fecha),
+      day = lubridate::day(fecha),
+      hour = hora,
+      tz = "America/Argentina/Buenos_Aires"
+    )
+  ) |>
+  # ====== Duplicados ====================================
+  distinct(nombre, fecha, hora, .keep_all = TRUE) %>%
+
+  # ========== Interpolación intra-estación de ff =============
+  
+  # 1. Ordenar los datos
+  arrange(nombre, datetime) |>
+  group_by(nombre) |>
+  mutate(
+    # Paso 1: Interpolación lineal (zoo::na.approx)
+    ff_interp = zoo::na.approx(ff,
+                               x = as.numeric(datetime),
+                               na.rm = FALSE, maxgap = 2),
+    
+    # Paso 2: Relleno hacia adelante (Last Observation Carried Forward). Se aplica sobre la columna 'ff_interp' recién creada en el paso anterior.
+    ff_interp = zoo::na.locf(ff_interp,
+                             na.rm = FALSE, maxgap = 2),
+    # Paso 3: Relleno hacia atrás (Next Observation Carried Backward). Se aplica sobre el resultado del Paso 2.
+    ff_interp = zoo::na.locf(ff_interp,
+                             fromLast = TRUE, na.rm = FALSE, maxgap = 2)
+  ) |>
+  ungroup() |>
+  select(-ff) |>
+  rename(ff = ff_interp)
+
+met_datos_limpio <- met_limpio_4.3
+```
+
+Este met_datos_limpio es nuestro conjunto de datos horario, limpio y procesado. Lo guardamos.
+
+```{r}
+saveRDS(met_datos_limpio, "met_datos_limpio.Rds")
+met_datos_limpio <- readRDS("met_datos_limpio.Rds")
+```
+
+# 4. Unificación con Metadatos y Datos de Precipitación
+
+Ahora que nuestros datos observacionales están limpios, los enriquecemos.
+- Cargamos smn_estaciones.csv (que contiene latitud, longitud y provincia) y lo unimos.
+- Cargamos un dataset separado de smn_precipitaciones-1991-2024.txt.
+Unimos estos datos.
+```{r}
+smn_estaciones <- read_csv("smn_estaciones.csv")
+smn_estaciones <- smn_estaciones |>
+  clean_names()
+met_con_info <- met_datos_limpio |>
+  left_join(smn_estaciones, by = "nombre")
+
+procesar_archivo_precipitacion <- function(ruta_archivo) {
+  
+  print(paste("Procesando (modo precipitación):", ruta_archivo))
+  
+  tryCatch({
+    
+    # --- 1. Leer el CSV ---
+    datos_precip <- readr::read_csv(
+      ruta_archivo,
+      locale = locale(encoding = "latin1"),
+      show_col_types = FALSE # Oculta los mensajes de tipo de columna
+    )
+    
+    # --- 2. Omitir archivos vacíos ---
+    if (is.null(datos_precip) || nrow(datos_precip) == 0) {
+      return(NULL)
+    }
+    
+    # --- 3. Limpiar y renombrar columnas ---
+    # El nombre de tu tercera columna "Precipitacion (mm) " es problemático
+    # (tiene un espacio o caracter raro al final).
+    # La forma más robusta de renombrarlo es por su posición.
+    
+    # Aquí seleccionamos las 3 columnas y les damos nombres limpios
+    datos_limpios <- datos_precip |>
+      select(
+        Estacion = 1,
+        Fecha = 2,
+        Precipitacion_mm = 3
+      )
+      
+    return(datos_limpios)
+    
+  }, error = function(e) {
+    warning(paste("Error GRAVE procesando (modo precipitación):", ruta_archivo, "-", e$message))
+    return(NULL)
+  })
+}
+
+datos_de_lluvia <- procesar_archivo_precipitacion("smn_precipitaciones-1991-2024/smn_precipitaciones-1991-2024.txt")
+
+datos_de_lluvia <- datos_de_lluvia |>
+  rename(
+    nro = Estacion,
+    fecha = Fecha,
+    precipitacion = Precipitacion_mm
+  )
+
+df_final <- met_con_info |>
+  left_join(
+    datos_de_lluvia,
+    by = c("nro", "fecha")
+  )  
+  
+
+df_lluvia_con_info <- datos_de_lluvia |>
+  left_join(smn_estaciones, by = "nro")
+```
+
+Guardamos los dataframes resultantes: df_final (datos horarios unidos con metadata y precipitación diaria) y df_lluvia_con_info (datos de precipitación diarios unidos con metadata).
+
+```{r}
+saveRDS(df_final, "df_final.Rds")
+saveRDS(df_lluvia_con_info, "df_lluvia_con_info.Rds")
+
+
+df_final <- readRDS("df_final.Rds")
+df_lluvia_con_info <- readRDS("df_lluvia_con_info.Rds")
+```
+
+## 4.1. Desagregación Temporal de Precipitación
+
+Hay un problema. El df de precipitaciones está por día, pero el de los datos está por hora.
+
+Esto presenta un desafío clave: nuestro dataset principal es horario, pero la precipitación es un total diario. Para analizarlos juntos, debemos desagregar ese total diario en estimaciones horarias.
+
+Implementamos un sistema lógico basado en la humedad:
+- Si la precipitación diaria es 0, todas las horas son 0.
+- Plan A: Si hay horas con humedad >= 90%, repartimos la lluvia equitativamente solo entre esas horas.
+- Plan B: Si no hay horas >= 90%, buscamos horas con humedad >= 70%. Repartimos la lluvia de forma ponderada (más humedad, más lluvia) entre esas horas.
+- Plan C: Si todas las horas tienen < 70% de humedad, repartimos la lluvia equitativamente entre las 24 horas.
+
+Esto crea la nueva columna precip_horaria.
+
+```{r}
+UMBRAL_ALTO <- 90
+UMBRAL_BAJO <- 70
+
+df_final_1.2 <- df_final |>
+  group_by(nombre, fecha) |>
+  mutate(
+    # --- Conversión y Ayudas Plan A (Umbral 90%) ---
+    precipitacion = as.numeric(precipitacion),
+    es_hora_humeda_alta = (hum >= UMBRAL_ALTO & !is.na(hum)),
+    n_horas_humedas_alta = sum(es_hora_humeda_alta),
+    
+    # --- Ayudas Plan B (Ponderado) ---
+    hum_a_ponderar = if_else(hum >= UMBRAL_BAJO & !is.na(hum), hum, 0),
+    total_hum_ponderada_dia = sum(hum_a_ponderar, na.rm = TRUE),
+
+    # === El Case When Final ===
+    precip_horaria = case_when(
+      
+      is.na(precipitacion) ~ NA_real_,
+      precipitacion == 0 ~ 0,
+      
+      precipitacion > 0 & n_horas_humedas_alta > 0 & es_hora_humeda_alta == TRUE ~ precipitacion / n_horas_humedas_alta,
+      precipitacion > 0 & n_horas_humedas_alta > 0 & es_hora_humeda_alta == FALSE ~ 0,
+      
+      precipitacion > 0 & n_horas_humedas_alta == 0 & total_hum_ponderada_dia > 0 ~ (hum_a_ponderar / total_hum_ponderada_dia) * precipitacion,
+      
+      precipitacion > 0 & n_horas_humedas_alta == 0 & total_hum_ponderada_dia == 0 ~ precipitacion / n(),
+      
+      .default = NA_real_ 
+    )
+  ) |>
+  ungroup() |>
+  select(
+    -es_hora_humeda_alta, -n_horas_humedas_alta, 
+    -hum_a_ponderar, -total_hum_ponderada_dia
+  )|>
+  arrange(fecha)
+
+# Dice que hay 2189 advertencias con as.numeric(precipitacion)
+
+df_final |>
+  filter(is.na(as.numeric(precipitacion))) |>
+  distinct(precipitacion) #son /N o NA
+```
+
+Guardamos este dataframe final, que ahora está completo y listo para el análisis.
+
+```{r}
+saveRDS(df_final_1.2, "df_final_1.2.Rds")
+df_final_1.2 <- readRDS("df_final_1.2.Rds")
+```
+
+# 5. Creación de Datasets Agregados
+
+Ahora creamos dataframes que nos ayudarán más adelante para los gráficos.
+
+Para realizar un análisis a nivel nacional, un simple promedio de todos los registros horarios sería incorrecto (sesgado). Debemos crear un promedio "justo".
+- daily_station: Agregamos los datos horarios para obtener resúmenes diarios por estación (media de temp, suma de precip, etc.).
+- monthly_by_station_fair: Agregamos los resúmenes diarios a mensuales, por estación. Filtramos los meses que no tengan al menos 25 días de datos (para que sean representativos).
+- monthly_national_fair: Calculamos el promedio nacional "justo". Tomamos los promedios mensuales de cada estación y calculamos la media de esos valores. Así, cada estación tiene un solo "voto" por mes. Filtramos los meses nacionales que no tengan datos de al menos 60 estaciones.
+
+```{r}
+df <- df_final_1.2 
+
+# ================== AGREGADOS PARA EDA ======================
+
+# ---- Diario por estación ----
+daily_station <- df |>
+  # Agrupamos por las columnas de la estación y por día/año/mes
+  group_by(
+    nro, nombre, provincia, latitud, longitud, 
+    ymd = fecha,
+    year = year(datetime),    
+    month = month(datetime)   
+  ) %>%
+  # Calculamos los resúmenes diarios
+  summarise(
+    registros  = n(),
+    temp_mean  = if (all(is.na(temp))) NA_real_ else mean(temp, na.rm = TRUE),
+    temp_sd    = sd(temp, na.rm = TRUE),
+    hum_mean   = if (all(is.na(hum))) NA_real_ else mean(hum, na.rm = TRUE),
+    pnm_mean   = if (all(is.na(pnm))) NA_real_ else mean(pnm, na.rm = TRUE),
+    precip_sum = sum(precip_horaria, na.rm = TRUE),
+    .groups = 'drop' 
+  )
+
+# ---- Nacional mensual "ingenuo" (para comparar) ----
+monthly_national_raw <- df |>
+  group_by(
+    year = year(datetime),
+    month = month(datetime)
+  ) |>
+  summarise(
+    temp_mean = mean(temp, na.rm = TRUE),
+    .groups = 'drop'
+  ) |>
+  mutate(
+    ym = as.Date(paste0(year, "-", sprintf("%02d", month), "-01"))
+  )
+
+# ---- Nacional mensual "justo" (fair): diario->mensual por estación->promedio nacional ----
+
+monthly_by_station_fair <- daily_station |>
+  group_by(
+    nro, 
+    ym = floor_date(ymd, "month") # redondea la fecha al primer día del mes
+  ) |>
+  summarise(
+    y = mean(temp_mean, na.rm = TRUE),
+    ndays = n(),
+    .groups = 'drop'
+  ) |>
+  filter(ndays >= 25)
+
+monthly_national_fair <- monthly_by_station_fair |>
+  group_by(ym) |>
+  # Calculamos el promedio de los promedios de las estaciones (y) y contamos cuántas estaciones (n_est) pasaron el filtro anterior
+  summarise(
+    temp_mean = mean(y, na.rm = TRUE),
+    n_est = n(),
+    .groups = 'drop'
+  ) |>
+  filter(n_est >= 60) |>
+  arrange(ym)
+
+
+# --- Impresión del resumen de cobertura ---
+cat("Cobertura media de estaciones por mes (fair):\n")
+monthly_national_fair |>
+  summarise(
+    mean_n_est = mean(n_est),
+    min_n_est = min(n_est),
+    max_n_est = max(n_est)
+  ) %>%
+  print()
+```
+
+Ahora comparamos el método "raw" con el "fair".
+
+El gráfico resultante muestra que ambas curvas son similares, pero el método "justo" maneja correctamente los datos incompletos al final del período (Oct 2024), donde no promedia porque no cumple los filtros de calidad.
+
+```{r}
+# ---- PASO 1: Combinar los data frames ----
+# Usamos bind_rows() para unirlos.
+# .id = "metodo" crea una nueva columna llamada 'metodo' que toma el nombre que le dimos a cada dataframe ("Justo" o "Ingenuo").
+
+df_comparativo <- bind_rows(
+  Justo   = monthly_national_fair,
+  Ingenuo = monthly_national_raw,
+  .id = "metodo"
+)
+
+ggplot(df_comparativo, aes(x = ym, y = temp_mean, color = metodo)) +
+  geom_line(linewidth = 1) +
+  geom_point(alpha = 0.5) + 
+  labs(
+    title = "Comparación de Promedio Mensual de Temperatura Nacional",
+    subtitle = "Método 'Justo' (promedio de estaciones) vs. 'Ingenuo' (promedio de lecturas)",
+    x = "Fecha",
+    y = "Temperatura Media (°C)",
+    color = "Método de Cálculo"
+  ) +
+  theme_minimal() +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") 
+```
+
+Guardamos estos importantes dataframes agregados.
+
+```{r}
+saveRDS(df, "df.Rds")
+saveRDS(daily_station, "daily_station.Rds")
+saveRDS(monthly_by_station_fair, "monthly_by_station_fair.Rds")
+saveRDS(monthly_national_fair, "monthly_national_fair.Rds")
+```
+
+
+# 6. Análisis Visual Exploratorio
+
+Con los datos limpios y agregados, comenzamos la exploración visual.
+
+## Bloque 1: Conociendo el Conjunto de Datos
+
+Primero, una visión general de la cobertura de datos.
+
+```{r}
+# =========== INTRO EDUCATIVA (PÚBLICO BÁSICO) ============= 
+# ---- 1 fila por estación (para mapa y barras) ----
+stations_tbl <- daily_station %>%
+  filter(!is.na(latitud) & !is.na(longitud)) %>%
+  group_by(nro) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(nro, nombre, provincia, latitud, longitud)
+```
+
+Un mapa interactivo nos permite explorar la ubicación de las estaciones, coloreadas por provincia.
+```{r}
+# ========= BLOQUE 1 – Conociendo el conjunto de datos ==========
+provincias_geo <- sf::st_read("shiny_app/data/provincias.geojson")
+# Usamos "Set3" o "Paired" que tienen muchos colores distintos.
+pal <- colorFactor(
+  palette = "Set3", # Una paleta con colores variados (como en tu mapa)
+  domain = provincias_geo$nombre # Basamos los colores en los nombres de provincia
+)
+
+m_intro <- leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  
+  # CAPA 1: Polígonos de Provincias (AHORA NO INTERACTIVOS)
+  addPolygons(
+    data = provincias_geo,
+    fillColor = ~pal(nombre), 
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    fillOpacity = 0.7,
+    
+    # --- CAMBIO CLAVE (Sintaxis correcta) ---
+    # Desactivamos el clic y el resaltado
+    options = pathOptions(interactive = FALSE) 
+  ) %>%
+  
+  # CAPA 2: Marcadores de Estaciones (ENCIMA Y CLICABLES)
+  addCircleMarkers(
+    data = stations_tbl,
+    lng = ~longitud, 
+    lat = ~latitud,
+    radius = 4, 
+    stroke = TRUE, 
+    weight = 1,
+    color = "black",
+    fillColor = "white",
+    fillOpacity = 0.9,
+    
+    # El popup de la estación ahora funcionará
+    popup = ~sprintf("<b>%s</b><br/>Provincia: %s", nombre, provincia)
+  ) %>%
+  
+  setView(lng = -64, lat = -38.4, zoom = 4)
+
+m_intro
+```
+
+Un gráfico de barras cuantifica esto, mostrando el número de estaciones por provincia.
+```{r}
+# (2) Barras: cantidad de estaciones por provincia
+bars_df <- stations_tbl %>%
+  count(provincia, name = "estaciones") %>%
+  arrange(desc(estaciones))
+
+# --- Gráfico ggplot modificado ---
+p_bars <- ggplot(bars_df, aes(x = reorder(provincia, estaciones), 
+                             y = estaciones, 
+                             fill = estaciones,
+                             # --- AÑADE ESTA LÍNEA ---
+                             text = paste("Estaciones:", estaciones) 
+                             )) +
+  geom_col() +
+  scale_fill_distiller(palette = "Blues", direction = 1) + 
+  coord_flip() +
+  labs(x = NULL, y = "Cantidad de estaciones", title = "Estaciones por provincia") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+# Convertir a plotly
+p_bars <- ggplotly(p_bars, tooltip = "text")
+p_bars
+```
+
+Finalmente, una serie temporal muestra el número de estaciones activas (que reportan datos) por año. Se observa una notable caída en los años más recientes del conjunto de datos.
+```{r}
+# (3) Timeline: estaciones activas por año (simple)
+# (Tu código de preparación de datos)
+years_active <- daily_station %>%
+  group_by(year) %>%
+  summarise(estaciones_activas = n_distinct(nombre), .groups = "drop") %>%
+  arrange(year)
+
+# --- Cálculo dinámico de los límites del zoom ---
+min_val <- min(years_active$estaciones_activas, na.rm = TRUE)
+max_val <- max(years_active$estaciones_activas, na.rm = TRUE)
+padding <- (max_val - min_val) * 0.2
+
+p_timeline_zoom <- ggplot(years_active, aes(year, estaciones_activas)) +
+  geom_area(fill = "#d62728", alpha = 0.3) + 
+  geom_line(color = "#d62728", linewidth = 1.2) +
+  
+  scale_x_continuous(breaks = pretty_breaks()) +
+  
+  labs(
+    x = "Año", y = "Estaciones activas", 
+    title = "Caída Reciente en el Conteo de Estaciones Activas",
+    subtitle = "Nota: El eje Y (vertical) no inicia en 0 para enfatizar la variación."
+  ) +
+  
+  # --- LA PARTE CLAVE ---
+  # Hacemos zoom en el eje Y. Los límites se calculan dinámicamente.
+  coord_cartesian(ylim = c(min_val - padding, max_val + padding)) +
+  
+  theme_minimal(base_size = 13)
+
+p_timeline_zoom <- ggplotly(p_timeline_zoom, tooltip = c("x", "y"))
+p_timeline_zoom
+```
+
+## Bloque 2: ¿Qué variables se registraron?
+
+Una tabla simple de KPIs (Indicadores Clave de Rendimiento) nos da los promedios generales del dataset.
+```{r}
+# ======== BLOQUE 2 – ¿Qué variables se registraron? =========
+
+# (4) KPIs sencillos (tabla) — se imprime en el Rmd
+kpis <- daily_station %>%
+  summarise(
+    # Envuelve los nombres con espacios y caracteres especiales en `backticks`
+    `Temp_media (°C)`          = mean(temp_mean, na.rm = TRUE),
+    `Humedad_media (%)`        = mean(hum_mean, na.rm = TRUE),
+    `Presión_media (hPa)`      = mean(pnm_mean, na.rm = TRUE),
+    `Lluvia_diaria_media (mm)` = mean(precip_sum, na.rm = TRUE)
+  )
+
+kpis_table <- knitr::kable(kpis, digits = 1, align = "r")
+kpis_table
+```
+
+Luego, generamos histogramas para visualizar la distribución de las principales variables diarias: Temperatura, Humedad y Presión.
+```{r}
+# (5) Histogramas simples por variable
+mk_hist <- function(df, var, titulo, xlab, 
+                    bins = 40, 
+                    fill_color = "#1f77b4", # <-- 1. Nuevo argumento con un color azul
+                    alpha = 0.8) {          # <-- 2. Nuevo argumento para transparencia
+  
+  gg <- ggplot(df, aes(x = .data[[var]])) +
+    geom_histogram(
+      bins = bins, 
+      boundary = 0, 
+      color = "white",      # Mantiene el borde blanco
+      fill = fill_color,    # <-- 3. Usa el color de relleno
+      alpha = alpha         # <-- 4. Aplica la transparencia
+    ) +
+    labs(title = titulo, x = xlab, y = "Frecuencia") +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none") # Oculta la leyenda (no necesaria)
+  
+  ggplotly(gg, tooltip = c("x","y"))
+}
+```
+
+```{r}
+dist_temp <- mk_hist(daily_station, "temp_mean",  "¿Cómo se reparte la temperatura?", "Temperatura (°C)")
+dist_temp
+
+dist_hum <- mk_hist(daily_station, "hum_mean",   "¿Cómo se reparte la humedad?", "Humedad relativa (%)")
+dist_hum
+
+dist_pnm <- mk_hist(daily_station, "pnm_mean",   "¿Cómo se reparte la presión?", "Presión (hPa)")
+dist_pnm
+```
+
+## Bloque 3: Una mirada rápida a los patrones
+
+¿Cómo interactúan estas variables?
+
+Este gráfico muestra el ciclo estacional promedio de temperatura. Los puntos están coloreados para mostrar claramente los meses fríos (azul) y cálidos (rojo).
+```{r}
+# ===================== BLOQUE 3 – Una mirada rápida a los patrones =====================
+
+# (6) Serie mensual promedio nacional (muy simple)
+# (1) Preparación de datos (igual que tu código)
+monthly_mean <- daily_station %>%
+  group_by(month) %>%
+  summarise(temp = mean(temp_mean, na.rm = TRUE), .groups = "drop") %>%
+  arrange(month) %>%
+  mutate(mes = factor(month.abb[month], levels = month.abb))
+
+# (2) Calcular el punto medio de la temperatura para centrar la paleta
+mid_temp <- mean(monthly_mean$temp, na.rm = TRUE)
+
+# --- (3) Gráfico ggplot Mejorado ---
+p_month <- ggplot(monthly_mean, aes(x = mes, y = temp, group = 1,
+                                   text = paste0("Mes: ", mes, "<br>Temp: ", 
+                                                 sprintf("%.1f", temp), "°C")
+                                   )) +
+  
+  # --- CAMBIO AQUÍ ---
+  # 1. La línea ahora es de un color gris estático.
+  geom_line(color = "grey80", linewidth = 1.2) + 
+  
+  # 2. Los puntos SÍ llevan el color dinámico.
+  geom_point(aes(color = temp), size = 3) +
+  # --- FIN DEL CAMBIO ---
+  
+  scale_color_gradient2(
+    low = "dodgerblue4",  
+    mid = "white",        
+    high = "firebrick",     
+    midpoint = mid_temp   
+  ) +
+  
+  labs(x = "Mes", y = "Temperatura media (°C)", 
+       title = "Ciclo Estacional de Temperatura") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+# --- (4) ggplotly con tooltip personalizado ---
+p_month <- ggplotly(p_month, tooltip = "text")
+p_month
+```
+
+Usamos un gráfico de hexágonos (geom_hex) para visualizar la densidad de la relación entre temperatura y humedad. Las áreas más oscuras indican las condiciones más frecuentes. La línea de regresión (roja) confirma la correlación negativa: a más calor, menos humedad relativa.
+```{r}
+# (7) Relación simple: Temperatura vs Humedad (muestra para no sobrecargar)
+set.seed(123)
+d_samp <- daily_station %>%
+  select(temp_mean, hum_mean) %>%
+  tidyr::drop_na()
+if (nrow(d_samp) > 3000) d_samp <- d_samp %>% dplyr::slice_sample(n = 3000)
+
+# --- Gráfico con geom_hex ---
+p_sc_hex <- ggplot(d_samp, aes(x = temp_mean, y = hum_mean)) +
+  
+  # 1. Reemplazamos geom_point por geom_hex
+  geom_hex(bins = 50) + # 'bins' controla el tamaño de los hexágonos
+  
+  # 2. Añadimos una escala de color (fill)
+  # 'trans = "log10"' es clave: evita que los puntos más densos "saturen" la escala
+  scale_fill_gradient(
+    low = "lightblue", 
+    high = "navyblue", 
+    trans = "log10", 
+    name = "Conteos" # Título de la leyenda
+  ) +
+  
+  # 3. Mantenemos la línea de regresión (en rojo para que resalte)
+  geom_smooth(method = "lm", se = FALSE, color = "red", linewidth = 1) +
+  
+  labs(x = "Temperatura (°C)", y = "Humedad relativa (%)",
+       title = "Densidad de la Relación Temperatura-Humedad") +
+  theme_minimal(base_size = 13)
+
+# 4. ggplotly (sin 'tooltip') para que muestre el conteo automáticamente
+p_sc_hex <- ggplotly(p_sc_hex)
+p_sc_hex
+```
+
+Acá usamos los datos del df original (horarios) para un análisis de densidad más profundo.
+
+Un gráfico de contorno 2D confirma la relación inversa entre temperatura y humedad.
+```{r}
+# ==================== CORRELACIONES ==========================
+set.seed(123)
+df_smpl <- df %>%
+  slice_sample(n = 300000)
+
+p_th_contour <- plot_ly(df_smpl, x = ~temp, y = ~hum, 
+                        type = "histogram2dcontour",
+                        colorscale = "Hot",
+                        colorbar = list(title = "<b>Nro. de<br>Observaciones</b>")
+                       ) %>%
+  layout(
+    # --- MODIFICACIÓN 2: Títulos más descriptivos ---
+    title = list(text = "Relación entre temperatura y humedad relativa<br><sup>A mayor temperatura, tiende a haber menor humedad. Densidad 2D de 300k obs.</sup>"),
+    
+    xaxis = list(title = "Temperatura (°C)"),
+    yaxis = list(title = "Humedad relativa (%)"),
+    
+    # --- MODIFICACIÓN 3: Arreglar el margen superior ---
+    margin = list(
+        b = 80, # Margen inferior para la "Fuente"
+        t = 80  # Nuevo margen superior para que entre el título/subtítulo
+    ),
+    
+    annotations = list(
+      list(text = "Fuente: SMN – elaboración propia.",
+           showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
+           xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+    )
+  )
+
+p_th_contour
+```
+
+Lo mismo pero entre temperatura y presión.
+
+Este histograma 2D muestra que las temperaturas más altas tienden a coincidir con presiones atmosféricas ligeramente menores, con una gran concentración de datos entre 1008 y 1022 hPa.
+```{r}
+# ---- Histograma de Densidad: TEMP vs PNM ----
+
+p_tp <- plot_ly(df_smpl, x = ~temp, y = ~pnm, type = "histogram2d") %>%
+  
+  # Usar plotly::layout para agrupar TODA la configuración
+  plotly::layout(
+    
+    title = list(text = "Temperaturas más altas tienden a coincidir con presiones atmosféricas ligeramente menores<br><sup>Densidad 2D con concentración en el rango 1008–1022 hPa</sup>"),
+    xaxis = list(title = "Temperatura (°C)"),
+    yaxis = list(title = "Presión a Nivel del Mar (hPa)"),
+    
+    # --- MODIFICACIÓN: 'colorbar' ahora vive DENTRO de layout ---
+    colorbar = list(title = "<b>Densidad de Horas</b>"), # Le agregué negrita
+    
+    # El margen que soluciona el corte del título
+    margin = list(b = 80, t = 100), 
+    
+    annotations = list(
+      list(text = "Fuente: SMN – elaboración propia.",
+           showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
+           xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+    )
+  )
+
+# Dejar que el notebook renderice el objeto
+p_tp
+```
+
+## Bloque 4: Análisis Geoespacial (Coropletas)
+
+Creamos un mapa de coropletas (mapa de polígonos coloreados) para visualizar la temperatura media por provincia, revelando el claro gradiente térmico de norte a sur.
+```{r}
+
+# ======= (Opcional) BLOQUE 4 – Mapa simple por provincia ========
+
+station_clima <- daily_station %>%
+    group_by(nro, provincia) %>%
+    summarise(temp_base = mean(temp_mean, na.rm = TRUE), .groups = "drop")
+
+prov_temp <- station_clima %>%
+    group_by(provincia) %>%
+    summarise(temp_prov = mean(temp_base, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      provincia_join_key = toupper(iconv(provincia, from = "UTF-8", to = "ASCII//TRANSLIT")),
+      provincia_join_key = dplyr::case_when(
+        provincia_join_key == "CAPITAL FEDERAL" ~ "CABA",
+        provincia_join_key == "TIERRA DEL FUEGO" ~ "TIERRA DEL FUEGO",
+        TRUE ~ provincia_join_key
+      )
+    )
+provincias_geo <- provincias_geo %>%
+  mutate(
+    provincia_join_key = toupper(iconv(nombre, from = "UTF-8", to = "ASCII//TRANSLIT")),
+    provincia_join_key = dplyr::case_when(
+      provincia_join_key == "CAPITAL FEDERAL" ~ "CABA",
+      provincia_join_key == "CIUDAD AUTONOMA DE BUENOS AIRES" ~ "CABA",
+      provincia_join_key == "TIERRA DEL FUEGO, ANTARTIDA E ISLAS DEL ATLANTICO SUR" ~ "TIERRA DEL FUEGO",
+      TRUE ~ provincia_join_key
+    )
+  )
+
+map_df <- provincias_geo %>%
+    left_join(prov_temp, by = c("provincia_join_key"))
+
+  pal <- colorNumeric("RdYlBu", domain = map_df$temp_prov, reverse = TRUE, na.color = "#BDBDBD")
+
+m_choro <- leaflet(map_df) |>
+    addProviderTiles(providers$CartoDB.Positron) |>
+    addPolygons(
+      fillColor = ~pal(temp_prov), color = "white", weight = 1, opacity = 1,
+      fillOpacity = 0.7,
+      label = ~htmltools::HTML(sprintf("<b>%s</b><br/>Temp media: %s °C",
+                                       nombre, ifelse(is.na(temp_prov), "s/d", sprintf("%.1f", temp_prov))))
+    ) |>
+    addLegend("bottomright", pal = pal, values = ~temp_prov,
+              title = "Temp media (°C)", opacity = 1) |>
+    setView(lng = -64, lat = -38.4, zoom = 4)
+m_choro
+
+
+# ===================== FIN INTRO EDUCATIVA (dplyr, sin saves) =====================
+```
+
+A continuación, creamos un mapa interactivo multicapa mucho más avanzado. Este mapa permite al usuario superponer y alternar entre cuatro vistas diferentes:
+- Estaciones (Temp media): Puntos coloreados por temperatura media.
+- Estaciones (Amplitud): Puntos coloreados por amplitud térmica (diferencia P90-P10).
+- Provincias (Temp media): El mapa de coropletas que acabamos de ver.
+- Provincias (Amplitud): Un mapa de coropletas de la amplitud térmica.
+Esto proporciona una herramienta muy rica para explorar patrones geoespaciales.
+
+```{r}
+# --- 1. PREPARACIÓN DE DATOS (Tu código original) ----
+
+# (Extremos)
+ext <- df %>%
+  filter(!is.na(temp)) %>%
+  group_by(nro, nombre, provincia, latitud, longitud) %>%
+  summarise(
+    p10 = quantile(temp, .10, na.rm = TRUE),
+    p90 = quantile(temp, .90, na.rm = TRUE),
+    amp = p90 - p10, 
+    .groups = 'drop' 
+  )
+
+# (Resumen de estaciones)
+stations <- df %>%
+  group_by(nro, nombre, provincia) %>%
+  summarise(
+    lat = first(latitud),
+    lon = first(longitud),
+    temp_mean = mean(temp, na.rm = TRUE),
+    sd_temp = sd(temp, na.rm = TRUE),
+    registros = n(),
+    .groups = 'drop'
+  ) %>%
+  filter(!is.na(lat) & !is.na(lon) & !is.na(temp_mean))
+
+# ---- 2. PRE-CÁLCULO DEL RADIO (Tu código original) ----
+stations <- stations %>%
+  mutate(
+    radius_val = scales::rescale(registros, to = c(3, 12))
+  )
+ext <- ext %>%
+  left_join(
+    stations %>% select(nro, registros, radius_val),
+    by = "nro"
+  )
+
+# --- 3. CARGAR GEOJSON Y AGREGAR DATOS (NUEVO) ---
+
+# 3.1 Funciones de ayuda (CORREGIDA)
+normalize_name <- function(name_vector) {
+  
+  # 1. Normalización (sin acentos, mayúsculas)
+  key <- toupper(iconv(name_vector, from = "UTF-8", to = "ASCII//TRANSLIT"))
+  
+  # 2. Limpieza (aplicar case_when al vector 'key')
+  dplyr::case_when(
+    key == "CAPITAL FEDERAL" ~ "CABA",
+    key == "CIUDAD AUTONOMA DE BUENOS AIRES" ~ "CABA",
+    key == "TIERRA DEL FUEGO, ANTARTIDA E ISLAS DEL ATLANTICO SUR" ~ "TIERRA DEL FUEGO",
+    # (Mantenemos el valor por defecto 'key')
+    TRUE ~ key 
+  )
+}
+
+# 3.2 Cargar y preparar el GeoJSON (Ahora funcionará)
+provincias_sf <- provincias_geo %>%
+  mutate(provincia_join_key = normalize_name(nombre))
+
+# 3.3 Agregar datos de ESTACIONES a nivel PROVINCIA
+prov_temp <- stations %>%
+  mutate(provincia_join_key = normalize_name(provincia)) %>%
+  group_by(provincia_join_key) %>%
+  summarise(
+    temp_prov = mean(temp_mean, na.rm = TRUE),
+    registros_prov = sum(registros, na.rm = TRUE)
+  )
+
+# 3.4 Agregar datos de AMPLITUD a nivel PROVINCIA
+prov_amp <- ext %>%
+  mutate(provincia_join_key = normalize_name(provincia)) %>%
+  group_by(provincia_join_key) %>%
+  summarise(
+    amp_prov = mean(amp, na.rm = TRUE)
+  )
+
+# 3.5 Unir datos agregados al GeoJSON
+map_df_temp <- provincias_sf %>%
+  left_join(prov_temp, by = "provincia_join_key")
+  
+map_df_amp <- provincias_sf %>%
+  left_join(prov_amp, by = "provincia_join_key")
+
+# ---- 4. PALETAS Y TÍTULO (Tu código original) ----
+pal_mean <- colorNumeric(
+  palette = c("#0000FF", "#FFFFFF", "#FF0000"),
+  domain = stations$temp_mean, 
+  na.color = NA
+)
+pal_amp  <- colorNumeric(viridisLite::magma(256), domain = ext$amp, na.color = NA)
+
+title_html <- '<div style="background-color: rgba(255,255,255,0.8); 
+                      border: 1px solid grey; border-radius: 5px; 
+                      padding: 5px 10px; text-align: center;">
+              <h4 style="margin:0;">Análisis de Estaciones SMN</h4>
+              <span style="font-size: 12px;">Temp. Media vs. Amplitud Térmica</span>
+              </div>'
+
+# ---- 5. CREACIÓN DEL MAPA (Modificado) ----
+m_map <- leaflet() %>% 
+  addTiles() %>%
+  addControl(html = title_html, position = "topleft") %>%
+  
+  # --- Capa 1: Estaciones (Temp media) ---
+  addCircleMarkers(
+    data = stations,
+    lng = ~lon, lat = ~lat, 
+    group = "Estaciones (Temp media)", # <-- Grupo 1
+    radius = ~radius_val,
+    color = ~pal_mean(temp_mean), fillColor = ~pal_mean(temp_mean),
+    fillOpacity = 0.85, stroke = FALSE,
+    popup = ~paste0("<b>", nombre, "</b><br>", provincia,
+                    "<br>Registros: ", registros,
+                    "<br>Temp media: ", round(temp_mean,2), " °C",
+                    "<br>SD: ", round(sd_temp,1), " °C")
+  ) %>%
+  addLegend(position="bottomright", pal=pal_mean, values=stations$temp_mean,
+            title="Temp media (°C)", group="Estaciones (Temp media)") %>%
+  
+  # --- Capa 2: Estaciones (Amplitud) ---
+  addCircleMarkers(
+    data = ext,
+    lng = ~longitud, lat = ~latitud, 
+    group = "Estaciones (Amplitud)", # <-- Grupo 2
+    radius = ~radius_val,
+    color = ~pal_amp(amp), fillColor = ~pal_amp(amp),
+    fillOpacity = 0.85, stroke = FALSE,
+    popup = ~paste0("<b>", nombre, "</b><br>", provincia,
+                    "<br>Registros: ", registros,
+                    "<br>Amplitud térmica (p90-p10): ", round(amp,1), " °C")
+  ) %>%
+  addLegend(position="bottomleft", pal=pal_amp, values=ext$amp,
+            title="Amplitud (°C)", group="Estaciones (Amplitud)") %>%
+
+  # --- Capa 3: Provincias (Temp media) (NUEVO) ---
+  addPolygons(
+    data = map_df_temp,
+    group = "Provincias (Temp media)", # <-- Grupo 3
+    fillColor = ~pal_mean(temp_prov),
+    weight = 1, opacity = 1, color = "white", fillOpacity = 0.7,
+    highlightOptions = highlightOptions(weight = 3, color = "#666", fillOpacity = 0.9, bringToFront = TRUE),
+    label = ~sprintf("<b>%s</b><br/>Temp media prov.: %s °C", 
+                     nombre, round(temp_prov, 1))
+  ) %>%
+  addLegend(position="bottomright", pal=pal_mean, values=stations$temp_mean, # Reusa la paleta
+            title="Temp media prov. (°C)", group="Provincias (Temp media)") %>%
+
+  # --- Capa 4: Provincias (Amplitud) (NUEVO) ---
+  addPolygons(
+    data = map_df_amp,
+    group = "Provincias (Amplitud)", # <-- Grupo 4
+    fillColor = ~pal_amp(amp_prov),
+    weight = 1, opacity = 1, color = "white", fillOpacity = 0.7,
+    highlightOptions = highlightOptions(weight = 3, color = "#666", fillOpacity = 0.9, bringToFront = TRUE),
+    label = ~sprintf("<b>%s</b><br/>Amplitud prov.: %s °C", 
+                     nombre, round(amp_prov, 1))
+  ) %>%
+  addLegend(position="bottomleft", pal=pal_amp, values=ext$amp, # Reusa la paleta
+            title="Amplitud prov. (°C)", group="Provincias (Amplitud)") %>%
+
+  # --- Control de capas (Ahora con 4 grupos) ---
+  addLayersControl(
+    baseGroups = c("Estaciones (Temp media)", "Provincias (Temp media)", 
+                   "Estaciones (Amplitud)", "Provincias (Amplitud)"), 
+    options = layersControlOptions(collapsed = FALSE, autoZIndex = TRUE)
+  )
+  
+# ---- 6. MOSTRAR EL MAPA ----
+m_map
+```
+
+# 7. Análisis Profundo de Series Temporales
+
+Volvemos a nuestro dataframe "justo" (monthly_national_fair) para un análisis más profundo de las tendencias a lo largo del tiempo.
+
+Un histograma de las temperaturas horarias (usando una muestra) nos permite anotar la media y mediana exactas.
+
+```{r}
+# =========================== VISUALES ===========================
+
+# ---- Histograma de temperatura (muestra) con media/mediana y límites útiles
+set.seed(123)
+mu       <- mean(df$temp); md <- median(df$temp)
+p_hist <- plot_ly(x = sample(df$temp, 200000), type = "histogram", nbinsx = 100) %>%
+  plotly::layout(
+    title = list(
+      text = "La distribución de temperaturas horarias muestra un amplio rango estacional<br><sup>Muestra de hasta 200k registros; líneas punteadas = media y mediana</sup>",
+      x = 0.05,
+      xanchor = 'left'
+    ),
+    xaxis = list(title = "Temperatura (°C)"),
+    yaxis = list(title = "Frecuencia (conteo de horas)"),
+    shapes = list(
+      list(type="line", x0=mu, x1=mu, y0=0, y1=1, xref="x", yref="paper", line=list(dash="dash")),
+      list(type="line", x0=md, x1=md, y0=0, y1=1, xref="x", yref="paper", line=list(dash="dot"))
+    ),
+    annotations = list(
+      # --- Anotación para la Media (mu = 16.3) ---
+      list(
+        x = mu, y = 0.88,  # <-- Posición Y
+        xref = "x", yref = "paper",
+        text = paste0("Media: ", round(mu,1),"°C"),
+        xanchor = 'right', # <-- Mueve el texto a la izquierda del punto
+        showarrow = TRUE, 
+        ax = -40, # <-- Flecha apunta desde la izquierda (-40)
+        ay = -40,
+        font = list(size = 10)
+      ),
+      # --- Anotación para la Mediana (md = 16.8) ---
+      list(
+        x = md, y = 0.82, # <-- Posición Y (más baja)
+        xref = "x", yref = "paper",
+        text = paste0("Mediana: ", round(md,1),"°C"),
+        xanchor = 'left', # <-- Mueve el texto a la derecha del punto
+        showarrow = TRUE, 
+        ax = 40, # <-- Flecha apunta desde la derecha (40)
+        ay = -30,
+        font = list(size = 10)
+      ),
+      # --- Anotación para la fuente (footer) ---
+      list(text = "Fuente: Servicio Meteorológico Nacional (SMN) – elaboración propia.",
+           showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
+           xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+    ),
+    margin = list(t = 100, b = 80)
+  )
+
+p_hist
+```
+
+Trazamos la serie temporal nacional "justa" y le ajustamos una tendencia lineal. El gráfico muestra un ciclo estacional muy fuerte. Aunque la línea de tendencia parece tener una ligera pendiente negativa, el p-valor (p > 0.05) es alto. Esto indica que la tendencia observada no es estadísticamente significativa y es consistente con el azar. A efectos prácticos, la tendencia en este período es plana.
+
+```{r}
+# 1. Preparar la línea de tendencia (ajustar el modelo lineal)
+df_trend <- monthly_national_fair %>% 
+  select(ym, temp_mean)
+
+mdl <- lm(temp_mean ~ as.numeric(ym), data = df_trend)
+
+# 2. Calcular los valores predichos
+df_trend <- df_trend %>% 
+  mutate(predicted = predict(mdl))
+
+# --- INICIO DE LA CORRECCIÓN ---
+# 2.1. Extraer los resultados del modelo
+model_summary <- summary(mdl)
+
+# 2.2. Obtener la pendiente (slope) y el p-valor (pv)
+# El coeficiente [2,1] es la pendiente (estimación de 'as.numeric(ym)')
+# El predictor 'as.numeric(ym)' cuenta en días, así que convertimos la pendiente a décadas
+slope_daily <- model_summary$coefficients[2, 1]
+slope_decade <- slope_daily * 365.25 * 10 # Convertir de días a décadas
+
+# El coeficiente [2,4] es el p-valor de la pendiente
+pv <- model_summary$coefficients[2, 4]
+
+p_trend <- plot_ly(df_trend, x = ~ym) %>%
+  
+  # Capa 1: Datos observados (Serie de tiempo)
+  add_trace(y = ~temp_mean, name = 'Temperatura Observada (Media)', 
+            type = 'scatter', mode = 'lines+markers', 
+            line = list(color = '#1f77b4'), marker = list(size = 4)) %>%
+  
+  # Capa 2: Línea de Tendencia (Modelo Lineal)
+  add_trace(y = ~predicted, name = 'Tendencia Lineal', 
+            type = 'scatter', mode = 'lines', 
+            line = list(color = '#d62728', dash = 'dash'), 
+            showlegend = TRUE) %>%
+  
+  # --- Layout Definitivo (Títulos Combinados) ---
+  layout(
+    
+    # Combinamos Título y Subtítulo en un solo bloque
+    title = list(
+      text = paste0(
+        # Título (Negrita, Tamaño 18)
+        "<b>Fuerte Ciclo Estacional Sin Tendencia Lineal Significativa</b>",
+        
+        # Salto de línea
+        "<br>",
+        
+        # Subtítulo (Tamaño 12, Color gris)
+        "<span style='font-size: 12px; color: gray;'>", 
+        "Pendiente calculada: ", 
+        sprintf("%.3f °C/década (p-valor: %.2f)", slope_decade, pv),
+        ". El p-valor alto (p > 0.05) indica que la tendencia es nula.",
+        "</span>"
+      ),
+      
+      # --- Parámetros de Centrado ---
+      x = 0.5,            # Posición horizontal (0.5 = centro)
+      xanchor = 'center',   # Anclaje (que el centro del texto esté en x=0.5)
+      y = 0.95,           # Posición vertical (cerca de la parte superior)
+      yanchor = 'top'
+    ),
+    
+    # Ya no usamos 'annotations' para el subtítulo
+    
+    xaxis = list(title = "Fecha", dtick = "M12", tickformat = "%b %Y"),
+    yaxis = list(title = "Temperatura media (°C)"),
+    legend = list(title = list(text='<b>Datos</b>')),
+    
+    # Margen para dar espacio
+    margin = list(t = 120) 
+  )
+
+p_trend
+```
+
+Este tipo de estudios sobre la climatología y sus anomalías suelen ser con datos mucho más extensos, de 30 años al menos. Acá contamos solo con 5 completos (2018-2023).
+
+Con esa climatología base (2018-2023), calculamos las anomalías mensuales (la diferencia de cada mes con su promedio histórico). El gráfico de barras resultante resalta los períodos cálidos prolongados en 2023 y un notable evento frío en 2024.
+
+```{r}
+# ---- Climatología 2018–2023 y Anomalías -------------------------------------
+# 1. clim_base: Calcular la climatología base
+# (Promedio histórico de temp. por mes, usando datos < 2024)
+clim_base <- monthly_national_fair |>
+  filter(ym < as.Date("2024-01-01")) |>
+  group_by(m = month(ym)) |>
+  summarise(
+    clim = mean(temp_mean, na.rm = TRUE),
+    .groups = 'drop' # Buena práctica para desagrupar
+  )
+
+# 2. anom_df: Calcular las anomalías
+anom_df <- monthly_national_fair |>
+  mutate(m = month(ym)) |>
+  left_join(clim_base, by = "m") |>
+  mutate(anom = temp_mean - clim)
+
+p_anom <- plot_ly(anom_df, x = ~ym, y = ~anom, type = 'bar',
+                  marker = list(color = ~ifelse(anom > 0, "#d62728", "#1f77b4"))) %>%
+  layout(
+  title = list(text = "Períodos cálidos prolongados en 2023 y un evento frío destacado en 2024<br><sup>Anomalías de temperatura mensual respecto del promedio 2018–2023</sup>"),
+  xaxis = list(
+    title = "Fecha",
+    dtick = "M12",               # Una marca/tick cada 12 meses
+    tickformat = "%b %Y"         # Formato "Mes-Año" (ej: "Ene 2018")
+),
+    yaxis = list(title = "Anomalía de temperatura (°C)"),
+    annotations = list(
+      list(text = "Fuente: SMN – elaboración propia.",
+           showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
+           xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+    ),
+    margin = list(b = 80)
+  )
+p_anom
+```
+
+Comparamos el ciclo diurno (horario) promedio para el verano y el invierno. El gráfico muestra claramente la diferencia en la amplitud térmica diaria y la diferencia de ~12°C entre las estaciones.
+```{r}
+diurnal <- df %>%
+  filter(!is.na(temp)) %>%
+  group_by(hora, m = month(datetime)) %>%
+  summarise(temp_mean = mean(temp, na.rm = TRUE), .groups = 'drop') %>%
+  mutate(
+    season = case_when(
+      m %in% c(12, 1, 2) ~ "Verano (DJF)",
+      m %in% c(6, 7, 8)  ~ "Invierno (JJA)",
+      .default = NA_character_ # Asigna NA al resto (otoño/primavera)
+    )
+  ) %>%
+  filter(!is.na(season)) %>%
+  group_by(hora, season) %>%
+  summarise(temp_mean = mean(temp_mean, na.rm = TRUE), .groups = 'drop') %>%
+  # Convertir 'season' a factor para ordenar en gráficos
+  mutate(
+    season = factor(season, levels = c("Verano (DJF)", "Invierno (JJA)"))
+  )
+
+p_diurnal <- plot_ly(diurnal, x=~hora, y=~temp_mean, color=~season, type='scatter', mode='lines+markers',
+                     colors = c("Invierno (JJA)" = "#1f77b4", "Verano (DJF)" = "#d62728")) %>%
+  layout(
+    title = list(text = "Temperaturas medias diurnas: Verano es ~12°C más cálido que el invierno<br><sup>Promedio horario nacional para Verano (DJF) e Invierno (JJA) del período 2018-2024</sup>"),
+    
+    xaxis = list(title = "Hora local", nticks = 24),
+    yaxis = list(title = "Temperatura media (°C)"),
+    legend = list(title = list(text = '<b> Estación </b>')),
+    annotations = list(
+      list(text = "Fuente: SMN – elaboración propia.",
+           showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
+           xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+    ),
+    margin = list(b = 80)
+  )
+
+p_diurnal
+```
+
+# 8. Análisis Detallados por Variable
+## 8.1. Precipitación
+Utilizando el conjunto de datos de precipitación más largo (1991-2024), analizamos la contribución de los eventos de lluvia "fuerte".
+Creamos un gráfico de barras apiladas que muestra la precipitación mensual total (promedio nacional) dividida en dos componentes:
+- Azul: Lluvia proveniente de días "ligeros" (< 50 mm).
+- Rojo: Lluvia proveniente de días "fuertes" (≥ 50 mm).
+Esto visualiza el impacto significativo que tienen los eventos extremos en el total de precipitación mensual.
+
+```{r}
+# ============= ANÁLISIS DE PRECIPITACIÓN (1991-2024) ============
+
+# 1. Preparación de Datos: Convertir y añadir bandera de día fuerte
+rain_daily_full <- df_lluvia_con_info |>
+  mutate(
+    FECHA = as.Date(fecha),
+    pp = as.numeric(precipitacion)
+  ) |>
+  filter(!is.na(nro), !is.na(fecha), !is.na(pp)) |>
+  select(nro, fecha, pp) |>
+  mutate(
+    is_heavy_day = pp >= 50
+  )
+
+# 2. Componentes Mensuales por Estación: Suma de las componentes
+rain_month_station_components <- rain_daily_full |>
+  mutate(ym = as.Date(format(fecha, "%Y-%m-01"))) |>
+  group_by(nro, ym, is_heavy_day) |>
+  summarise(
+    pp_component = sum(pp, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# 3. Pivotear y Calcular Promedio Nacional ("Fair")
+rain_month_national_stacked_full <- rain_month_station_components |>
+  tidyr::pivot_wider(
+    names_from = is_heavy_day,
+    values_from = pp_component,
+    names_prefix = "pp_",
+    values_fill = 0
+  ) |>
+  rename(pp_heavy = pp_TRUE, pp_light = pp_FALSE) |>
+  
+  # Calcular el Promedio Nacional (Método FAIR)
+  group_by(ym) |>
+  summarise(
+    pp_nat_light = mean(pp_light, na.rm = TRUE),
+    pp_nat_heavy = mean(pp_heavy, na.rm = TRUE),
+    .groups = 'drop'
+  ) |>
+  arrange(ym)
+
+# 4. Generación del Gráfico Apilado (Plotly)
+
+p_rain_full <- plot_ly(rain_month_national_stacked_full, x = ~ym) %>%
+    add_trace(
+    y = ~pp_nat_heavy,
+    type = 'bar',
+    name = 'En días ≥ 50mm',
+    marker = list(color = '#d62728')
+  ) %>%
+  add_trace(
+    y = ~pp_nat_light,
+    type = 'bar',
+    name = 'En días < 50mm',
+    marker = list(color = '#1f77b4')
+  ) %>%
+  layout(
+    barmode = 'stack',
+    title = list(text = "Contribución de días de lluvia fuerte (≥ 50mm) a la precipitación mensual<br><sup>Promedio de acumulados mensuales por estación para el periodo 1991–2024</sup>"),
+    xaxis = list(
+      title = "Fecha",
+      dtick = "M24", # Marcar cada 2 años
+      tickformat = "%Y"
+    ),
+    yaxis = list(title = "Precipitación mensual promedio (mm)"),
+    
+    annotations = list(
+      list(text = "Fuente: SMN – elaboración propia (datos de precipitación desde 1991).",
+           showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
+           xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+    ),
+    margin = list(b = 80)
+  )
+
+p_rain_full
+```
+En promedio, ¿cuántos milímetros recibe mensualmente una ubicación aleatoria en Argentina de la lluvia que proviene de eventos torrenciales? El tamaño de la barra roja refleja la rareza del evento, ya que es la la suma de los mm de lluvia fuerte por mes dividio el numero de estaciones. La suma de ambas barras es el promedio de precipitación mensual.
+
+A continuación, creamos un mapa para visualizar dónde ocurren estos eventos extremos. Los círculos representan estaciones, con el tamaño y color indicando la frecuencia de días con lluvia >= 50 mm. Se observa una clara concentración en las regiones NEA/Litoral.
+```{r}
+# Mapa de eventos de precipitación extrema (≥ 50 mm/día)
+# Lluvia diaria por estación-fecha + lat/lon calculados en j
+rain_daily <- df %>%
+  # Agrupar por estación y fecha
+  group_by(nro, nombre, provincia, fecha = as.Date(datetime)) %>%
+  
+  # Calcular precipitación diaria total (pp) y obtener coords
+  summarise(
+    pp = sum(precip_horaria, na.rm = TRUE),
+    lat = first(latitud), # Equivalente a latitud[1L]
+    lon = first(longitud),# Equivalente a longitud[1L]
+    .groups = 'drop'
+  )
+
+# ======================================================
+# 2. heavy50_day: Filtrar umbral (>= 50 mm/día) y coords válidas
+# ======================================================
+
+heavy50_day <- rain_daily %>%
+  filter(pp >= 50 & is.finite(lat) & is.finite(lon))
+
+# ======================================================
+# 3. heavy50: Agregar por estación (contar eventos y máximo diario)
+# ======================================================
+
+heavy50 <- heavy50_day %>%
+  # Agrupar por las características únicas de la estación
+  group_by(nro, nombre, provincia) %>%
+  
+  # Calcular métricas de eventos extremos
+  summarise(
+    eventos_50mm = n(),           # Equivalente a .N
+    max_diario   = max(pp, na.rm = TRUE),
+    lat          = first(lat),    # Tomar la primera latitud válida
+    lon          = first(lon),    # Tomar la primera longitud válida
+    .groups = 'drop'
+  )
+
+# ======================================================
+# 4. Paleta de color (Método Tidyverse/Leaflet)
+# ======================================================
+
+pal_events <- colorNumeric(brewer.pal(9, "Blues"), 
+                           domain = heavy50$eventos_50mm)
+
+# Mapa
+m_ext <- leaflet(heavy50) %>% addTiles() %>%
+  addCircleMarkers(
+    lng = ~lon, lat = ~lat,
+    radius = ~pmin(14, 4 + scales::rescale(eventos_50mm, to = c(2, 12))),
+    color = ~pal_events(eventos_50mm), fillColor = ~pal_events(eventos_50mm),
+    fillOpacity = 0.9, stroke = FALSE,
+    popup = ~paste0(
+      "<b>", nombre, "</b><br>", provincia,
+      "<br>Eventos ≥50 mm/día: ", eventos_50mm,
+      "<br>Máx diario: ", round(max_diario, 1), " mm"
+    )
+  ) %>%
+  
+  # --- MODIFICACIÓN 2: Título de leyenda más conciso ---
+  addLegend("bottomright", pal = pal_events, values = ~eventos_50mm,
+            title = "Frecuencia de Eventos") 
+  
+# --- MODIFICACIÓN 3: Título movido a la esquina superior izquierda (topleft) ---
+title_ext_html <- htmltools::tags$div(
+  style = "width: 280px;",
+  htmltools::tags$h4("Eventos de precipitación extrema (≥ 50 mm/día)"),
+  htmltools::tags$p("Mayor concentración de eventos en NEA/Litoral. El tamaño del punto es proporcional al conteo.", 
+                    style = "font-size: small;"),
+  htmltools::tags$em("Fuente: SMN – elaboración propia.", style = "font-size: small;")
+)
+
+m_ext <- m_ext %>%
+  addControl(title_ext_html, position = "topleft")
+
+m_ext
+```
+
+
+## 8.2. Demanda Energética (Grados-Día)
+
+Calculamos los Grados-Día de Calefacción (HDD) y Enfriamiento (CDD). Estas métricas estiman la demanda de energía.
+- HDD (Azul): Mide cuánto frío hizo, indicando la demanda de calefacción.
+- CDD (Rojo): Mide cuánto calor hizo, indicando la demanda de refrigeración (aire acondicionado).
+El gráfico de áreas muestra la clara estacionalidad de la demanda energética: picos de HDD en invierno y picos de CDD en verano.
+
+```{r}
+# --- Definición de Temperaturas Base Ajustadas ---
+T_BASE_CALENTAMIENTO <- 14 # Típica base ajustada para calefacción (HDD)
+T_BASE_ENFRIAMIENTO <- 24 # Típica base para enfriamiento (CDD)
+
+# ======================================================
+# 1. Grados-día DIARIOS por ESTACIÓN (CON BASES AJUSTADAS)
+# ======================================================
+
+dd_station_day_mejorado <- df %>%
+  filter(!is.na(temp)) %>%
+  group_by(nro, fecha = as.Date(datetime)) %>%
+  
+  # Fórmulas ajustadas con T_BASE_CALENTAMIENTO (16°C) y T_BASE_ENFRIAMIENTO (22°C)
+  summarise(
+    # HDD: Necesidad de Calefacción (base 16°C)
+    HDD = sum(pmax(0, T_BASE_CALENTAMIENTO - temp)) / 24, 
+    
+    # CDD: Necesidad de Enfriamiento (base 22°C)
+    CDD = sum(pmax(0, temp - T_BASE_ENFRIAMIENTO)) / 24, 
+    .groups = 'drop'
+  )
+
+# ======================================================
+# 2. Acumulado Mensual y 3. Mediana Nacional
+# ======================================================
+
+dd_month_national_mejorado <- dd_station_day_mejorado %>%
+  
+  # 2. Acumulado Mensual por Estación
+  group_by(
+    nro, 
+    ym = floor_date(fecha, "month") 
+  ) %>%
+  summarise(
+    HDD_month = sum(HDD, na.rm = TRUE),
+    CDD_month = sum(CDD, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  
+  # 3. Mediana Nacional "Justa"
+  group_by(ym) %>%
+  summarise(
+    HDD_nat = median(HDD_month, na.rm = TRUE),
+    CDD_nat = median(CDD_month, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(ym)
+
+# ---
+# 4. Gráfico de ÁREA (La alternativa)
+# ---
+p_dd <- plot_ly(dd_month_national, x = ~ym) %>%
+  
+  # Capa de Calefacción (HDD)
+  add_trace(
+    y = ~HDD_nat, 
+    name = "Calefacción (HDD)", 
+    type = 'scatter', 
+    mode = 'lines',
+    line = list(color = '#1f77b4'), # Azul
+    fill = 'tozeroy',
+    fillcolor = 'rgba(31, 119, 180, 0.4)' # Mismo azul, con transparencia
+  ) %>%
+  
+  # Capa de Refrigeración (CDD)
+  add_trace(
+    y = ~CDD_nat, 
+    name = "Refrigeración (CDD)", 
+    type = 'scatter', 
+    mode = 'lines',
+    line = list(color = '#d62728'), # Rojo/Naranja
+    fill = 'tozeroy', # <-- ¡LA MAGIA ESTÁ AQUÍ!
+    fillcolor = 'rgba(214, 39, 40, 0.4)' # Mismo rojo, con transparencia
+  ) %>%
+  
+  # --- Layout ---
+  layout(
+    title = list(text = "La demanda energética potencial por clima sigue un fuerte ciclo estacional<br><sup>Mediana de Grados-Día (HDD/CDD) por estación, umbral 18°C</sup>"),
+    xaxis = list(
+      title = "Fecha",
+      dtick = "M12",
+      tickformat = "%b %Y"
+    ),
+    yaxis = list(title = "Grados-día acumulados (Mediana)"), 
+    legend = list(title = list(text='<b> Demanda </b>')),
+    annotations = list(
+      list(text = "Fuente: SMN – elaboración propia.",
+           showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
+           xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+    ),
+    margin = list(b = 80)
+  )
+p_dd
+```
+
+## 8.3. Viento (Rosa de Vientos)
+
+Generamos una "Rosa de Vientos" para la estación con más registros. Este gráfico especializado muestra la frecuencia e intensidad del viento por dirección. En este ejemplo, se observa un claro predominio de vientos del Norte y Sudeste.
+```{r}
+# ==================== ROSA DE VIENTOS ========================
+# 1. Identificar la estación con más datos
+st <- df %>%
+  count(nombre, sort = TRUE) %>%
+  slice(1) %>%
+  pull(nombre) # Extraer el valor como un vector simple
+
+# 2. Filtrar el data frame original para obtener los datos de viento
+wind_df <- df %>%
+  filter(nombre == st) %>%
+  select(
+    ws = ff,     # Velocidad del viento (wind speed)
+    wd = dd,     # Dirección del viento (wind direction)
+    date = datetime # Fecha y hora
+  )
+
+cat(sprintf("Rosa de vientos para estación %s:\n", st))
+
+# Definición de los breaks originales
+my_breaks <- c(0, 2, 4, 6, 8, 12, 20, 48)
+
+# --- TU NUEVA ESTRATEGIA DE LABELS ---
+# Creamos 8 labels (etiquetas), una para CADA punto de break
+# (0, 2, 4, 6, 8, 12, 20, y el final 48)
+my_key_labels <- c("0", "2", "4", "6", "8", "12", "20", "48")
+
+wind_plot <- openair::windRose(
+  wind_df,
+  ws = "ws",
+  wd = "wd",
+  breaks = my_breaks, # Los breaks para el cálculo
+  paddle = FALSE,
+  key.position = "bottom",
+  auto.text = FALSE,
+  
+  main = paste("Predominio de vientos del Norte y Sudeste en la estación", as.character(st)),
+  sub = "La frecuencia y la intensidad (m/s) definen el patrón local.\nFuente: SMN – elaboración propia.",
+
+  # --- AJUSTE CLAVE: Usar el argumento 'key' como una lista ---
+  # Esto le pasa opciones directamente a la función 'draw.colorkey' de lattice
+  key = list(
+    # 'at' le dice dónde poner los 'ticks' de color (los 8 valores de break)
+    at = my_breaks, 
+    
+    # 'labels' le dice qué texto poner en esos 'ticks' (las 8 etiquetas que creamos)
+    labels = my_key_labels,
+    
+    # 'cex' controla el tamaño de la fuente de los labels de la leyenda
+    cex = 0.9, # Reducimos un poco la fuente para que quepa bien
+    
+    # 'space' controla dónde va la leyenda
+    space = "bottom"
+  ),
+  
+  # A openair le gusta tener un key.footer para las unidades
+  key.footer = "(m/s)",
+  
+  # Mantener los ajustes de espacio que arreglaron el título/subtítulo
+  par.settings = list(
+    layout.heights = list(
+      bottom.padding = 4, 
+      sub = 4             
+    ),
+    fontsize = list(text = 9, points = 9) # Mantenemos la fuente legible
+  )
+)
+
+wind_plot
+```
+
+Llevamos esto un paso más allá y creamos un mapa interactivo de Rosas de Viento.
+- El script genera un PNG miniatura de la rosa de vientos para cada estación.
+- El mapa agrupa estas rosas en clústeres. Al hacer zoom, los clústeres se expanden ("spiderfy").
+- Una capa de "Resumen" muestra círculos simples coloreados por la velocidad media del viento.
+- Al hacer clic en una rosa miniatura, aparece una versión más grande y detallada en el pop-up.
+
+```{r}
+set.seed(42) # Para reproducibilidad del clustering
+
+# --- 1) Definición de Estilo (El que te gustó) ---
+output_dir <- "wind_roses"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+# Breaks y Labels que definimos (para la leyenda 'key = list')
+my_breaks <- c(0, 2, 4, 6, 8, 12, 20, 48)
+my_key_labels <- c("0", "2", "4", "6", "8", "12", "20", "48")
+
+# --- 2) Información de Estaciones (dplyr) ---
+stations_info <- df %>%
+  filter(is.finite(latitud) & is.finite(longitud)) %>%
+  group_by(nro, nombre, provincia) %>%
+  summarise(
+    lat = first(latitud),
+    lon = first(longitud),
+    .groups = 'drop'
+  ) %>%
+  filter(is.finite(lat) & is.finite(lon))
+
+# --- 3) Función 'make_wind_rose_png' (CORREGIDA) ---
+
+make_wind_rose_png <- function(stn_dt, st_name, file_png, width, height, res,
+                               is_thumb = TRUE) {
+  
+  grDevices::png(filename = file_png, width = width, height = height, res = res, bg = "transparent")
+  on.exit(grDevices::dev.off(), add = TRUE)
+  
+  if (is_thumb) {
+    # --- THUMBNAIL (Método robusto) ---
+    # Ocultamos todo para el ícono
+    openair::windRose(
+      stn_dt, ws = "ff", wd = "dd",
+      breaks = my_breaks,
+      paddle = FALSE, 
+      auto.text = FALSE,
+      key = FALSE,      # Oculta la leyenda
+      main = " ",       # Oculta títulos
+      sub = " ",
+      xlab = " ",
+      ylab = " "
+    )
+    
+  } else {
+    # --- FULL PNG (Aplicando la solución que pediste) ---
+    # (Este es el bloque de código exacto de tu ejemplo)
+    openair::windRose(
+      stn_dt,
+      ws = "ff", 
+      wd = "dd", 
+      breaks = my_breaks,
+      paddle = FALSE,
+      key.position = "bottom",
+      auto.text = FALSE,
+      
+      main = paste("Rosa de Viento:", st_name),
+      sub = "Frecuencia e intensidad (m/s). Fuente: SMN",
+      
+      # --- AJUSTE CLAVE: Usar el argumento 'key' ---
+      key = list(
+        at = my_breaks, 
+        labels = my_key_labels, # Labels limpios ("0", "2"...)
+        cex = 0.9,
+        space = "bottom"
+      ),
+      
+      key.footer = "(m/s)",
+      
+      # Ajustes de márgenes y fuentes
+      par.settings = list(
+        layout.heights = list(
+          bottom.padding = 4, 
+          sub = 4
+        ),
+        fontsize = list(text = 9, points = 9)
+      )
+    )
+  }
+}
+
+# --- 4) Bucle de Generación (Thumb + Full) ---
+png_thumb_list <- list()
+png_full_list <- list()
+cat("Generando", nrow(stations_info), "pares de rosas de viento en", output_dir, "...\n")
+
+for (i in seq_len(nrow(stations_info))) {
+  id      <- stations_info$nro[i]
+  st_name <- stations_info$nombre[i]
+  
+  stn_dt <- df %>%
+    filter(nro == id, is.finite(ff), is.finite(dd)) %>%
+    select(ff, dd)
+  
+  if (!nrow(stn_dt)) next
+  
+  clean_name <- janitor::make_clean_names(st_name)
+  f_thumb <- file.path(output_dir, sprintf("%s_thumb.png", clean_name))
+  f_full  <- file.path(output_dir, sprintf("%s_full.png",  clean_name))
+  
+  # Generar PNG miniatura (pequeño y limpio)
+  make_wind_rose_png(stn_dt, st_name, f_thumb, width = 100, height = 100, res = 72, is_thumb = TRUE)
+  # Generar PNG completo (MÁS GRANDE: 400x400 para que entren títulos)
+  make_wind_rose_png(stn_dt, st_name, f_full,  width = 400, height = 400, res = 96, is_thumb = FALSE)
+  
+  png_thumb_list[[as.character(id)]] <- f_thumb
+  png_full_list[[as.character(id)]] <- f_full
+}
+
+# --- 5) Combinar y Codificar en Base64 ---
+thumb_df <- tibble(nro_str = names(png_thumb_list), png_thumb = unlist(png_thumb_list))
+full_df  <- tibble(nro_str = names(png_full_list),  png_full  = unlist(png_full_list))
+
+map_data <- stations_info %>%
+  mutate(nro_str = as.character(nro)) %>%
+  left_join(thumb_df, by = "nro_str") %>%
+  left_join(full_df,  by = "nro_str") %>%
+  select(-nro_str) %>%
+  filter(file.exists(png_thumb) & file.exists(png_full))
+
+stopifnot(nrow(map_data) > 0)
+
+map_data <- map_data %>%
+  rowwise() %>%
+  mutate(
+    png_thumb_data = base64enc::dataURI(file = png_thumb, mime = "image/png"),
+    png_full_data  = base64enc::dataURI(file = png_full,  mime = "image/png")
+  ) %>%
+  ungroup()
+
+# --- 6) Capa "resumen" (Círculos) ---
+# (CORREGIDO: 'lon' en lugar de 'Lo')
+stations_speed <- df %>%
+  filter(is.finite(ff)) %>%
+  group_by(nro) %>%
+  summarise(
+    ws_mean = mean(ff, na.rm = TRUE),
+    lat = first(latitud), 
+    lon = first(longitud), # <-- ¡Error corregido!
+    nombre = first(nombre), 
+    provincia = first(provincia),
+    .groups = 'drop'
+  ) %>%
+  filter(is.finite(lat) & is.finite(lon))
+
+pal_ws <- leaflet::colorNumeric("YlGnBu", domain = stations_speed$ws_mean)
+
+# --- 7) Mapa Leaflet (Clúster + Popup) ---
+icon_rose <- leaflet::icons(
+  iconUrl   = map_data$png_thumb_data, # El ícono es la miniatura limpia
+  iconWidth = 72, iconHeight = 72,      # Tamaño que permite la expansión (spiderfy)
+  className = "rose"
+)
+
+m <- leaflet::leaflet() %>%
+  leaflet::addProviderTiles(leaflet::providers$CartoDB.Positron) %>%
+  
+  # Capa Resumen (círculos)
+  leaflet::addCircleMarkers(
+    data = stations_speed, group = "Resumen (círculos)",
+    lng = ~lon, lat = ~lat, radius = 6,
+    fillColor = ~pal_ws(ws_mean), fillOpacity = 0.8, stroke = FALSE,
+    popup = ~paste0("<b>", nombre, "</b><br>", provincia,
+                    "<br>Viento medio: ", round(ws_mean, 1), " m/s")
+  ) %>%
+  leaflet::addLegend("bottomright", pal = pal_ws, values = stations_speed$ws_mean,
+                     title = "Velocidad del viento (m/s)", group = "Resumen (círculos)") %>%
+  
+  # Capa Detalle (rosas)
+  leaflet::addMarkers(
+    data = map_data, group = "Rosas (detalle)",
+    lng = ~lon, lat = ~lat, icon = icon_rose, # Ícono = thumb
+    
+    # Popup = full
+    popup = ~sprintf("<b>Estacionalidad (%s)</b><br><img src='%s' width='280'>", 
+                     nombre, png_full_data),
+    
+    options = leaflet::markerOptions(zIndexOffset = 1000),
+    clusterOptions = leaflet::markerClusterOptions(
+      disableClusteringAtZoom = 8, 
+      spiderfyOnMaxZoom = TRUE,     # La expansión FUNCIONARÁ
+      showCoverageOnHover = FALSE,
+      maxClusterRadius = 60
+    )
+  ) %>%
+  leaflet::addLayersControl(
+    overlayGroups = c("Resumen (círculos)", "Rosas (detalle)"),
+    options = leaflet::layersControlOptions(collapsed = FALSE)
+  ) %>%
+  leaflet::hideGroup("Rosas (detalle)")
+
+# Mostrar el mapa
+m
+```
+
+# 9. Dispersión y Modelado
+## 9.1. Dispersión entre Estaciones
+
+Este "gráfico de cinta" (ribbon plot) muestra la serie temporal nacional, pero en lugar de solo la media, grafica la mediana (P50) y el rango del 80% (P10-P90) de todas las estaciones.
+
+La cinta (área sombreada) representa la dispersión o variabilidad entre las diferentes regiones del país. Se puede ver que la variabilidad es mayor en invierno (cinta más ancha).
+```{r}
+# Ribbons de percentiles nacionales (dispersión entre estaciones)
+nat_percentiles <- monthly_by_station_fair %>%
+  group_by(ym) %>%
+  summarise(
+    # La columna 'y' contiene la temperatura media mensual por estación
+    p10 = quantile(y, 0.10, na.rm = TRUE),
+    p50 = quantile(y, 0.50, na.rm = TRUE),
+    p90 = quantile(y, 0.90, na.rm = TRUE),
+    n_est = n(), 
+    .groups = 'drop'
+  ) %>%
+  # Ordenar por fecha
+  arrange(ym)
+
+p_ribbon <- plot_ly(nat_percentiles, x=~ym) %>%
+    
+    # 1. Banda de Variabilidad (p10-p90)
+    add_ribbons(ymin = ~p10, ymax = ~p90, 
+                name = "Rango 80% (p10–p90)", 
+                opacity = 0.25,
+                line = list(color = 'transparent'), 
+                fillcolor = 'lightblue') %>% 
+    
+    # 2. Línea Central (Mediana)
+    add_trace(y=~p50, name="Mediana (P50)", mode="lines",
+              line = list(color = '#1f77b4', width = 2)) %>%
+    
+    # --- Layout Final Integrando el Análisis de Sesgo ---
+    layout(
+        # Título: El título principal se mantiene descriptivo.
+        title = list(text = "Temperatura nacional: un ciclo estacional constante con alta amplitud anual<br>
+        <sup><b>La mediana (P50) se acerca al límite superior (P90) en verano, indicando un fuerte sesgo hacia condiciones cálidas en la mayoría de las estaciones.</b></sup>"),
+        
+        # Eje X 
+        xaxis = list(
+            title = "Fecha",
+            dtick = "M12", 
+            tickformat = "%b %Y"
+        ),
+        
+        # Eje Y
+        yaxis = list(title="Temperatura Mensual (°C)"), 
+        
+        # Leyenda
+        legend = list(title = list(text = '<b>Métricas</b>'),
+                      x = 100,
+                      y = 1),
+        
+        # Fuente
+        annotations = list(
+            list(text = "Fuente: SMN – elaboración propia.",
+                 showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
+                 xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+        ),
+        
+        margin = list(b = 80, t = 80)
+    )
+
+p_ribbon
+```
+
+
+## 9.2. Modelado y Pronóstico (Prophet)
+
+Como experimento final, intentamos predecir datos meteorológicos usando el modelo prophet de Facebook / Meta.
+
+Primero, intentamos pronosticar la precipitación mensual para la estación con más datos (1991-2024). Entrenamos con datos hasta 2017 y probamos en 2018-adelante. El modelo captura la estacionalidad general.
+
+```{r}
+# --- PASO 1: Cargar y Preparar los Datos ---
+df_lluvia <- df_lluvia_con_info
+
+# Limpiamos los datos
+df_limpio <- df_lluvia %>%
+  mutate(
+    fecha = as.Date(fecha),
+    precipitacion = as.numeric(precipitacion)
+  )
+
+# --- PASO 2: Encontrar la Mejor Estación (con más datos válidos) ---
+estacion_con_mas_datos <- df_limpio %>%
+  group_by(nombre) %>%
+  summarise(
+    registros_validos = sum(!is.na(precipitacion))
+  ) %>%
+  # Ordenamos de mayor a menor
+  arrange(desc(registros_validos)) %>%
+  # Elegimos la primera (la mejor)
+  slice(1) %>%
+  pull(nombre) # Extraemos el nombre
+
+print(paste("Estación seleccionada:", estacion_con_mas_datos))
+
+# --- PASO 3: Preparar Datos para Prophet (Filtrar y Agregar) ---
+df_prophet <- df_limpio %>%
+  filter(nombre == estacion_con_mas_datos) %>%
+  mutate(mes_ano = floor_date(fecha, "month")) %>%
+  group_by(mes_ano) %>%
+  summarise(
+    precipitacion_total = sum(precipitacion, na.rm = TRUE)
+  ) %>%
+  # Renombramos para que Prophet entienda
+  rename(
+    ds = mes_ano,
+    y = precipitacion_total
+  ) %>%
+  ungroup()
+
+# --- PASO 4: Dividir Datos (Train y Test) ---
+# Train: 1991-01-01 hasta 2017-12-31
+# Test: 2018-01-01 hasta el final
+
+df_train <- df_prophet %>%
+  filter(ds <= as.Date("2017-12-31"))
+
+df_test <- df_prophet %>%
+  filter(ds > as.Date("2017-12-31"))
+
+print(paste("Registros de Entrenamiento:", nrow(df_train)))
+print(paste("Registros de Prueba:", nrow(df_test)))
+
+# --- PASO 5: Crear y Entrenar el Modelo Prophet ---
+
+# Iniciamos Prophet.
+# Prophet detectará automáticamente la estacionalidad anual (yearly.seasonality)
+# ya que tenemos datos de varios años.
+model <- prophet()
+
+# Ajustamos el modelo (entrenamos)
+model <- fit.prophet(model, df_train)
+
+# --- PASO 6: Predecir y Evaluar ---
+future_test <- df_test %>% select(ds)
+
+# Realizamos la predicción
+forecast <- predict(model, future_test)
+
+# Unimos la predicción (forecast) con los valores reales (df_test)
+# para poder comparar
+df_comparacion <- forecast %>%
+  select(ds, yhat, yhat_lower, yhat_upper) %>%
+  left_join(df_test, by = "ds")
+
+# --- PASO 7: Visualizar los Resultados ---
+
+# 1. Gráfico completo de Prophet (Predicción vs Real)
+# Esto creará un gráfico interactivo si estás en RStudio
+plot_forecast <- plot(model, forecast)
+plot_forecast <- plotly::ggplotly(plot_forecast) # <-- AÑADE ESTA LÍNEA
+plot_forecast
+
+# 2. Gráfico de los componentes del modelo
+# Esto te mostrará la tendencia, la estacionalidad anual, etc.
+plot_forecast_comp
+```
+
+Repetimos el proceso para la temperatura diaria, que es una señal mucho más estable. Entrenamos el modelo en la estación con más datos de temperatura hasta finales de 2023 y le pedimos que prediga el futuro (el "test set").
+```{r}
+# --- PASO 2: Encontrar la Mejor Estación (con más datos de TEMPERATURA) ---
+estacion_con_mas_datos_temp <- df %>%
+  filter(!is.na(temp)) %>% # Filtramos NAs de temperatura
+  group_by(nombre) %>%
+  summarise(registros_validos = n()) %>% # Contamos las filas restantes
+  arrange(desc(registros_validos)) %>%
+  slice(1) %>%
+  pull(nombre) 
+
+print(paste("Estación seleccionada (con más datos de temp):", estacion_con_mas_datos_temp))
+
+# --- PASO 3: Preparar Datos para Prophet (AGREGACIÓN DIARIA) ---
+df_prophet_diario <- df %>%
+  filter(nombre == estacion_con_mas_datos_temp) %>%
+  group_by(fecha) %>%
+  summarise(
+    temp_media_diaria = mean(temp, na.rm = TRUE)
+  ) %>%
+  rename(
+    ds = fecha,
+    y = temp_media_diaria
+  ) %>%
+  ungroup() %>%
+  distinct() # Nos aseguramos de tener un solo valor por día
+
+# --- PASO 4: Dividir Datos (Train y Test) ---
+fecha_corte <- as.Date("2023-10-07")
+
+df_train_diario <- df_prophet_diario %>%
+  filter(ds <= fecha_corte)
+
+df_test_diario <- df_prophet_diario %>%
+  filter(ds > fecha_corte)
+
+print(paste("Registros Diarios de Entrenamiento:", nrow(df_train_diario)))
+print(paste("Registros Diarios de Prueba:", nrow(df_test_diario)))
+
+# --- PASO 5: Crear y Entrenar el Modelo Prophet ---
+# Prophet detectará automáticamente la estacionalidad ANUAL y SEMANAL
+model_temp_diario <- prophet(weekly.seasonality = FALSE)
+
+# Ajustamos el modelo (entrenamos)
+model_temp_diario <- fit.prophet(model_temp_diario, df_train_diario)
+
+# --- PASO 6: Predecir y Evaluar ---
+
+# Creamos un dataframe "futuro"
+future_test_diario <- df_test_diario %>% select(ds)
+
+# Realizamos la predicción
+forecast_temp_diario <- predict(model_temp_diario, future_test_diario)
+
+# --- PASO 7: Visualizar los Resultados ---
+
+# 1. Gráfico completo de Prophet (Predicción vs Real)
+# Esto tardará un poquito más en generarse, ¡tiene muchos puntos!
+p_main <- plot(model_temp_diario, forecast_temp_diario)
+p_main <- plotly::ggplotly(p_main)
+p_main
+# 2. Gráfico de los componentes del modelo
+# Ahora verás una estacionalidad "semanal" (weekly) además de la anual
+p_comp
+```
+
+El gráfico de componentes (p_comp) descompone el pronóstico del modelo, mostrando la fuerte tendencia anual y la tendencia semanal (patrones de días de la semana).
+
+El gráfico de comparación (pr_comp) muestra que la predicción del modelo (azul) sigue muy de cerca a los valores reales (negro) en el conjunto de prueba.
+
+```{r}
+# --- PASO 8: Comparar Predicción Diaria vs. Realidad (Gráfico Final) ---
+
+# 1. Unimos las predicciones con los datos reales del Test Set (Diario)
+df_comparacion_diario <- forecast_temp_diario %>%
+  select(ds, yhat, yhat_lower, yhat_upper) %>%
+  left_join(df_test_diario, by = "ds") # 'df_test_diario' tiene el valor real 'y'
+
+# 2. Graficamos la comparación usando ggplot2
+# (Asegúrate de tener 'library(ggplot2)' cargada al inicio de tu Rmd)
+
+pr_comp <- ggplot(df_comparacion_diario, aes(x = ds)) +
+  
+  # Línea Negra: Los valores REALES diarios que guardamos
+  geom_line(aes(y = y, color = "Valor Real"), linewidth = 0.8) +
+  
+  # Línea Azul Punteada: La PREDICCIÓN diaria del modelo
+  geom_line(aes(y = yhat, color = "Predicción"), linetype = "dashed", linewidth = 1) +
+  
+  # Área Gris de Incertidumbre
+  geom_ribbon(aes(ymin = yhat_lower, ymax = yhat_upper), fill = "grey", alpha = 0.3) +
+  
+  # Títulos y colores
+  scale_color_manual(values = c("Valor Real" = "black", "Predicción" = "dodgerblue")) +
+  labs(title = "Comparación: Temperatura Diaria Real vs. Predicción (Test Set)",
+       subtitle = "El modelo sigue bien la tendencia general y la estacionalidad.",
+       y = "Temperatura Media Diaria (°C)",
+       x = "Fecha",
+       color = "Leyenda") +
+  theme_minimal()
+pr_comp <- plotly::ggplotly(pr_comp)
+pr_comp
+```
+
+Calculamos el error numérico:
+- MAE (Error Absoluto Medio): En promedio, el modelo se equivoca por esta cantidad de grados.
+- RMSE (Raíz del Error Cuadrático Medio): Similar al MAE, pero penaliza más los errores grandes.
+
+```{r}
+# --- PASO 9: Evaluación Numérica (MAE y RMSE) ---
+
+# 1. Calculamos el error de cada día
+df_errores <- df_comparacion_diario %>%
+  mutate(
+    error = y - yhat,           # Error (diferencia simple)
+    error_absoluto = abs(error) # Error absoluto (siempre positivo)
+  )
+
+# 2. Calculamos el MAE (Mean Absolute Error)
+# Es el promedio de los errores absolutos
+mae <- mean(df_errores$error_absoluto, na.rm = TRUE)
+
+print(paste("MAE (Error Absoluto Medio):", round(mae, 2), "grados"))
+print("Esto significa que, en promedio, el modelo se equivocó por esta cantidad de grados.")
+
+# 3. Calculamos el RMSE (Root Mean Squared Error)
+# Es la raíz cuadrada del promedio de los errores al cuadrado
+rmse <- sqrt(mean(df_errores$error^2, na.rm = TRUE))
+
+print(paste("RMSE (Raíz del Error Cuadrático Medio):", round(rmse, 2), "grados"))
+print("Similar al MAE, pero penaliza más los errores grandes.")
+```
+
+Finalmente, analizamos los residuos (los errores del modelo). El gráfico de residuos en el tiempo (p_res) debe parecer ruido aleatorio centrado en 0.
+```{r}
+# --- PASO 10 (A): Gráfico de Residuos a lo largo del tiempo ---
+
+# df_errores ya tiene la columna 'error' (y - yhat) y 'ds' (fecha)
+p_res <- ggplot(df_errores, aes(x = ds, y = error)) +
+  geom_line(color = "red", alpha = 0.8) +
+  
+  # Línea de referencia en 0 (el error perfecto)
+  geom_hline(yintercept = 0, linetype = "dashed", color = "blue", linewidth = 1) +
+  
+  labs(title = "Residuos (Errores) a lo largo del tiempo",
+       subtitle = "Idealmente: Ruido aleatorio centrado en 0",
+       y = "Error (Real - Predicción en °C)",
+       x = "Fecha") +
+  theme_minimal()
+p_res <- plotly::ggplotly(p_res)
+p_res
+```
+```{r}
+# --- PASO 10 (B): Histograma de Residuos ---
+
+hist_res <- ggplot(df_errores, aes(x = error)) +
+  
+  # Histograma con un color de relleno más agradable
+  geom_histogram(aes(y = ..density..), 
+                 bins = 40, # Aumentamos un poco los bins
+                 fill = "deepskyblue3", 
+                 color = "white", # Borde blanco para separar las barras
+                 alpha = 0.8) +
+  
+  # Curva de densidad para ver la forma general
+  geom_density(color = "black", linewidth = 1.2, alpha = 0.9) +
+  
+  # Línea vertical en Cero (Error Perfecto)
+  geom_vline(xintercept = 0, 
+             color = "black", 
+             linetype = "dashed", 
+             linewidth = 1.2) +
+  
+  # Líneas verticales para el Error Absoluto Medio (MAE)
+  # Esto nos da un contexto de qué tan grande es el error promedio
+  geom_vline(xintercept = mae, 
+             color = "red", 
+             linetype = "dotted", 
+             linewidth = 1) +
+  geom_vline(xintercept = -mae, 
+             color = "red", 
+             linetype = "dotted", 
+             linewidth = 1) +
+  
+  # Títulos y etiquetas mejorados
+  labs(
+    title = "Distribución de Errores de Predicción",
+    subtitle = paste0("La mayoría de los errores se centran en 0.\nLas líneas rojas punteadas marcan el Error Absoluto Medio (MAE: +/- ", round(mae, 2), "°)"),
+    x = "Error de Predicción (Grados °C)",
+    y = "Densidad"
+  ) +
+  
+  # Un tema limpio
+  theme_minimal()
+hist_res <- plotly::ggplotly(hist_res)
+hist_res
+```
+El histograma de residuos (hist_res) muestra que la gran mayoría de los errores son muy cercanos a cero, con algunos errores más grandes en las colas. Esto confirma un buen ajuste del modelo.
+
+# 10. Salida de Datos y Gráficos
+## Descarga de dataframes para construir graficos en la shiny app
+En este bloque final, preparamos los datos para ser consumidos por una aplicación externa (como una Shiny app). Normalizamos los dataframes clave (como feat_month, daily_station) y los guardamos en formato .Rds.
+```{r}
+# --- 0) Normalización de df ---------------------------------------------------
+# df ya existe en memoria
+df <- as.data.table(df)
+setnames(df, make_clean_names(names(df)))
+
+# Tipos (sin :=, usando set())
+# fecha
+df[, fecha_chr := as.character(fecha)]
+set(df, j = "fecha", value = as.Date(df[["fecha_chr"]]))
+df[, fecha_chr := NULL]
+
+# hora, nro
+set(df, j = "hora", value = as.integer(df[["hora"]]))
+set(df, j = "nro",  value = as.integer(df[["nro"]]))
+
+# lat/long
+set(df, j = "latitud",  value = as.numeric(df[["latitud"]]))
+set(df, j = "longitud", value = as.numeric(df[["longitud"]]))
+
+# datetime local BA
+set(df, j = "datetime",
+    value = as.POSIXct(paste(df[["fecha"]], sprintf("%02d:00:00", df[["hora"]])),
+                       tz = "America/Argentina/Buenos_Aires"))
+
+.save_rds(df, "data/df_clean")
+.save_rds(daily_station, "data/daily_station")
+.save_rds(monthly_by_station, "data/monthly_by_station")
+
+# --- 1) GDD mensual (base 10°C) ----------------------------------------------
+gdd_daily <- df[!is.na(temp),
+                .(gdd = sum(pmax(0, temp - 10))/24),
+                by = .(nro, ymd = as.Date(datetime))]
+gdd_month <- gdd_daily[, .(gdd_m = sum(gdd)),
+                       by = .(nro, ym = as.Date(format(ymd, "%Y-%m-01")))]
+
+.save_rds(gdd_month, "data/gdd_month")
+
+# --- 2) Join de estaciones (Nro -> Nombre) -----------------------------------
+suppressPackageStartupMessages({
+  library(data.table); library(janitor)
+})
+
+# 2.1 Cargar CSV y normalizar nombres
+est_csv <- fread("smn_estaciones.csv", encoding = "UTF-8")
+setnames(est_csv, make_clean_names(names(est_csv)))  # 'Nro'->'nro', 'Nombre'->'nombre'
+
+# 2.2 Tipos y validaciones
+if (!"nro" %in% names(est_csv)) stop("El CSV no tiene columna 'Nro' (o 'nro' tras normalizar).")
+if (!"nombre" %in% names(est_csv)) stop("El CSV no tiene columna 'Nombre' (o 'nombre' tras normalizar).")
+est_csv[, nro := as.integer(nro)]
+est_csv[, nombre := as.character(nombre)]
+
+# 2.3 Resolver duplicados por nro: quedarnos con el nombre más frecuente
+est_map <- est_csv[!is.na(nro) & !is.na(nombre),
+                   .N, by = .(nro, nombre)][order(nro, -N)][, .SD[1], by = nro][, N := NULL]
+
+# 2.4 Asegurar tipos en gdd_month y agregar nombre_ref
+stopifnot(exists("gdd_month"))
+setnames(gdd_month, make_clean_names(names(gdd_month)))
+if (!"nro" %in% names(gdd_month)) stop("gdd_month no tiene columna 'nro'.")  # corregido el typo
+gdd_month[, nro := as.integer(nro)]
+
+gdd_month_joined <- merge(
+  gdd_month,
+  est_map[, .(nro, nombre_ref = nombre)],
+  by = "nro", all.x = TRUE
+)
+
+# --- 3) Preparar monthly_by_station (tiene nombre, ds, y) --------------------
+monthly_by_station <- as.data.table(monthly_by_station)
+setnames(monthly_by_station, make_clean_names(names(monthly_by_station)))  # nombre, ds, y
+
+# Validaciones mínimas
+if (!all(c("nombre","ds") %in% names(monthly_by_station))) {
+  stop("monthly_by_station debe tener columnas 'nombre' y 'ds'.")
+}
+monthly_by_station[, nombre := as.character(nombre)]
+monthly_by_station[, ds := as.character(ds)]
+
+# ds puede venir como "YYYY-MM" o "YYYY-MM-DD": normalizo y creo ym = primer día de mes
+monthly_by_station[, ds := ifelse(grepl("^\\d{4}-\\d{2}$", ds), paste0(ds, "-01"), ds)]
+monthly_by_station[, ym := as.Date(ds)]
+monthly_by_station[, ym := as.Date(format(ym, "%Y-%m-01"))]
+
+# --- 4) Agregar GDD por nombre + mes -----------------------------------------
+# Normalizo gdd_month_joined y agrego por nombre_ref + ym
+setnames(gdd_month_joined, make_clean_names(names(gdd_month_joined)))
+if (!all(c("nombre_ref","ym","gdd_m") %in% names(gdd_month_joined))) {
+  stop("gdd_month_joined debe tener 'nombre_ref', 'ym' y 'gdd_m'.")
+}
+gdd_month_joined[, nombre_ref := as.character(nombre_ref)]
+gdd_month_joined[, ym := as.Date(ym)]
+
+# Si existiera más de un nro con el mismo nombre en un mes, sumo gdd_m
+gdd_by_nombre <- gdd_month_joined[!is.na(nombre_ref) & !is.na(ym),
+                                  .(gdd_m = sum(gdd_m, na.rm = TRUE)),
+                                  by = .(nombre = nombre_ref, ym)]
+
+# --- 5) Features integradas: merge por nombre + ym ---------------------------
+feat_month <- merge(
+  monthly_by_station,
+  gdd_by_nombre,
+  by = c("nombre","ym"),
+  all.x = TRUE
+)
+
+# Orden sugerido si esas columnas existen
+cols_target <- c("nombre","ym","y","ds","gdd_m","latitud","longitud","provincia",
+                 "temp_m","hum_m","ff_m","pnm_m","pp_m","ndays")
+setcolorder(feat_month, c(intersect(cols_target, names(feat_month)),
+                          setdiff(names(feat_month), cols_target)))
+
+.save_rds(feat_month, "data/feat_month")
+
+# --- 6) Choices básicos para la app ------------------------------------------
+estaciones <- sort(unique(na.omit(feat_month$nombre)))
+anios      <- sort(unique(year(feat_month$ym)))  # años presentes en los datos mensuales
+.save_rds(estaciones, "data/estaciones")
+.save_rds(anios,      "data/anios")
+
+message("=== Listo. Merge por nombre + ym; sin requerir nro en monthly_by_station ===")
+
+```
+
+## Descarga de gráficos en memoria para exponer
+
+Por último, definimos una función de ayuda (save_all_plots) que recorre el entorno de R, encuentra todos los objetos de gráficos (ggplot, plotly, leaflet, trellis) que creamos durante este análisis y los guarda automáticamente en disco (como PNG, PDF, HTML) en la carpeta figs/.
+
+Esto nos permite exportar fácilmente todas las visualizaciones en la propia shiny app.
+
+```{r}
+save_all_plots <- function(
+  dir_out = "figs",
+  formats = c("png","pdf","svg"),
+  width = 7, height = 5, dpi = 300,
+  env = .GlobalEnv
+) {
+  dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+  objs <- ls(envir = env, all.names = TRUE)
+  n_saved <- 0
+
+  for (nm in objs) {
+    obj <- get(nm, envir = env)
+
+    # --- ggplot2 --------------------------------------------------------------
+    if (inherits(obj, "ggplot")) {
+      for (fmt in formats) {
+        f <- file.path(dir_out, paste0(nm, ".", fmt))
+        try({
+          ggplot2::ggsave(
+            filename = f, plot = obj,
+            width = width, height = height, dpi = dpi, units = "in", device = fmt
+          )
+          n_saved <- n_saved + 1
+        }, silent = TRUE)
+      }
+      next
+    }
+
+    # --- htmlwidgets: plotly/leaflet/highcharter ------------------------------
+    if (inherits(obj, "htmlwidget")) {
+      f <- file.path(dir_out, paste0(nm, ".html"))
+      try({
+        htmlwidgets::saveWidget(obj, file = f, selfcontained = TRUE)
+        n_saved <- n_saved + 1
+      }, silent = TRUE)
+      next
+    }
+
+    # --- lattice/trellis ------------------------------------------------------
+    if (inherits(obj, "trellis")) {
+      for (fmt in formats) {
+        f <- file.path(dir_out, paste0(nm, ".", fmt))
+        try({
+          switch(fmt,
+            png = {
+              png(f, width = width, height = height, units = "in", res = dpi)
+              print(obj); dev.off()
+            },
+            pdf = {
+              pdf(f, width = width, height = height)
+              print(obj); dev.off()
+            },
+            svg = {
+              svg(f, width = width, height = height)
+              print(obj); dev.off()
+            },
+            { } # otros formatos se pueden agregar acá
+          )
+          n_saved <- n_saved + 1
+        }, silent = TRUE)
+      }
+      next
+    }
+
+    # --- gráficos base guardados con recordPlot() -----------------------------
+    if (inherits(obj, "recordedplot")) {
+      f_png <- file.path(dir_out, paste0(nm, ".png"))
+      try({
+        png(f_png, width = width, height = height, units = "in", res = dpi)
+        replayPlot(obj)
+        dev.off()
+        n_saved <- n_saved + 1
+      }, silent = TRUE)
+      next
+    }
+  }
+
+  message(sprintf("Listo: guardados %d archivos en '%s'.", n_saved, dir_out))
+}
+
+# Ejecutá:
+save_all_plots(dir_out = "figs", formats = c("png","pdf","svg"), width = 7, height = 5, dpi = 300)
+
+```
