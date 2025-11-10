@@ -358,12 +358,12 @@ ui <- page_navbar(
              )
     ),
     
-    p(class="story-text", "Anomalías mensuales vs. climatología 2018–2023."),
+    p(class="story-text", "Anomalías diarias vs. climatología 2018–2023."),
     tags$div(class = "container-fluid",
              tags$div(class = "row justify-content-center",
                       tags$div(class = "col-lg-10 col-xl-8",
                                tags$div(class = "static-chart-container",
-                                        h4(tagList("Anomalías Mensuales", actionLink("expand_p_anom", "Expandir ↗", style = "float: right; font-weight: bold;"))),
+                                        h4(tagList("Anomalías Diarias", actionLink("expand_p_anom", "Expandir ↗", style = "float: right; font-weight: bold;"))),
                                         p(class = "text-muted", "2023 cálido; evento frío en 2024."),
                                         auto_iframe("p_anom")
                                )

@@ -1687,41 +1687,106 @@ Este tipo de estudios sobre la climatología y sus anomalías suelen ser con dat
 Con esa climatología base (2018-2023), calculamos las anomalías mensuales (la diferencia de cada mes con su promedio histórico). El gráfico de barras resultante resalta los períodos cálidos prolongados en 2023 y un notable evento frío en 2024.
 
 ```{r}
-# ---- Climatología 2018–2023 y Anomalías -------------------------------------
-# 1. clim_base: Calcular la climatología base
-# (Promedio histórico de temp. por mes, usando datos < 2024)
-clim_base <- monthly_national_fair |>
-  filter(ym < as.Date("2024-01-01")) |>
-  group_by(m = month(ym)) |>
-  summarise(
-    clim = mean(temp_mean, na.rm = TRUE),
-    .groups = 'drop' # Buena práctica para desagrupar
+# ================== Promedio diario nacional (plotly) ==================
+
+# --------- Parámetros ---------
+value_col  <- if ("tmax" %in% names(daily_station)) "tmax" else "temp_mean"
+plot_start <- as.Date("2018-01-01")
+plot_end   <- as.Date("2023-12-31")
+norm_years <- 2018:2023
+
+stopifnot(all(c("ymd","year","month", value_col) %in% names(daily_station)))
+
+# --------- 1) Promedio diario nacional ---------
+nat_daily <- daily_station %>%
+  filter(ymd >= plot_start, ymd <= plot_end) %>%
+  group_by(ymd) %>%
+  summarise(value = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    year  = year(ymd),
+    doy   = yday(ymd),
+    is29f = (month(ymd) == 2 & mday(ymd) == 29)
+  ) %>%
+  filter(!is29f)
+
+# --------- 2) Climatología diaria (promedio por DOY) ---------
+clim_doy <- nat_daily %>%
+  filter(year %in% norm_years) %>%
+  group_by(doy) %>%
+  summarise(clim = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Suavizado tipo SMN (curva negra)
+lo <- loess(clim ~ doy, data = clim_doy, span = 0.25, degree = 2, family = "gaussian")
+clim_doy <- clim_doy %>%
+  mutate(clim_smooth = as.numeric(predict(lo, newdata = data.frame(doy = doy))))
+
+# --------- 3) Unir serie diaria con la climatología ---------
+plot_df <- nat_daily %>%
+  left_join(clim_doy, by = "doy") %>%
+  mutate(
+    delta = value - clim_smooth,
+    signo = if_else(delta >= 0, "sobre", "bajo")
   )
 
-# 2. anom_df: Calcular las anomalías
-anom_df <- monthly_national_fair |>
-  mutate(m = month(ym)) |>
-  left_join(clim_base, by = "m") |>
-  mutate(anom = temp_mean - clim)
+titulo_var <- if (value_col == "tmax") {
+  "Temperatura máxima — Promedio diario nacional"
+} else {
+  "Temperatura — Promedio diario nacional"
+}
 
-p_anom <- plot_ly(anom_df, x = ~ym, y = ~anom, type = 'bar',
-                  marker = list(color = ~ifelse(anom > 0, "#d62728", "#1f77b4"))) %>%
+y_rng <- range(c(plot_df$value, plot_df$clim_smooth), na.rm = TRUE) + c(-1, 1)
+
+# --------- 4) Gráfico (plotly) ---------
+p_anom <- plot_ly(plot_df, x = ~ymd, hoverinfo = "skip") %>%
+  # Barras verticales (como linerange en ggplot)
+  add_segments(
+    y = ~pmin(value, clim_smooth),
+    yend = ~pmax(value, clim_smooth),
+    xend = ~ymd,
+    color = ~signo,
+    colors = c("bajo" = "#55C3D3", "sobre" = "#C23BAA"),
+    name = "Diferencia",
+    showlegend = FALSE
+  ) %>%
+  # Serie observada
+  add_lines(
+    y = ~value,
+    name = "Promedio diario nacional",
+    line = list(color = "rgba(160,160,160,1)", width = 1),
+    hovertemplate = "%{x|%d-%m-%Y}<br>Promedio: %{y:.1f}°C<extra></extra>"
+  ) %>%
+  # “Normal” suavizada
+  add_lines(
+    y = ~clim_smooth,
+    name = sprintf("Normal diaria %d–%d (suavizada)", min(norm_years), max(norm_years)),
+    line = list(color = "black", width = 2),
+    hovertemplate = "%{x|%d-%m-%Y}<br>Normal: %{y:.1f}°C<extra></extra>"
+  ) %>%
   layout(
-  title = list(text = "Períodos cálidos prolongados en 2023 y un evento frío destacado en 2024<br><sup>Anomalías de temperatura mensual respecto del promedio 2018–2023</sup>"),
-  xaxis = list(
-    title = "Fecha",
-    dtick = "M12",               # Una marca/tick cada 12 meses
-    tickformat = "%b %Y"         # Formato "Mes-Año" (ej: "Ene 2018")
-),
-    yaxis = list(title = "Anomalía de temperatura (°C)"),
-    annotations = list(
-      list(text = "Fuente: SMN – elaboración propia.",
-           showarrow = FALSE, xref = "paper", yref = "paper", x = 1, y = -0.15,
-           xanchor = 'right', yanchor = 'auto', font = list(size = 10))
+    title = list(
+      text = paste0(
+        titulo_var,
+        "<br><sup>Argentina — ", format(plot_start, "%Y-%m-%d"),
+        " a ", format(plot_end, "%Y-%m-%d"), "</sup>"
+      )
     ),
-    margin = list(b = 80)
+    xaxis = list(title = NULL, dtick = "M3", tickformat = "%b %Y"),
+    yaxis = list(title = "Temperatura (°C)", range = y_rng),
+    margin = list(b = 80),
+    annotations = list(
+      list(
+        text = sprintf(
+          "Normal diaria: promedio %d–%d (loess). Fuente: SMN – elaboración propia.",
+          min(norm_years), max(norm_years)
+        ),
+        showarrow = FALSE, xref = "paper", yref = "paper",
+        x = 1, y = -0.18, xanchor = "right", font = list(size = 10)
+      )
+    )
   )
+
 p_anom
+# ================== FIN ======================================================
 ```
 
 Comparamos el ciclo diurno (horario) promedio para el verano y el invierno. El gráfico muestra claramente la diferencia en la amplitud térmica diaria y la diferencia de ~12°C entre las estaciones.
