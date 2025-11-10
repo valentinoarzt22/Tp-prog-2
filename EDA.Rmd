@@ -47,7 +47,7 @@ No tenemos el dataset completo. Hay que armarlo. Primero empezamos uniendo los a
 # PASO 2: Definir la ubicación de tus archivos
 # -----------------------------------------------------------------
 # Usa "." si ya estableciste el directorio de trabajo (recomendado)
-ruta_carpeta <- "C:/Users/tomas/Desktop/universidad/Ciencia de Datos/programación ii - R/TP 2/smn-data"
+ruta_carpeta <- "smn-data/"
 
 # -----------------------------------------------------------------
 # PASO 3: La función de procesamiento (REGEX HIPER-REFINADO)
