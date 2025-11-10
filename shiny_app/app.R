@@ -42,7 +42,7 @@ read_obj <- function(name, dirs = c("data", "../data", "..")) {
 }
 
 ## Helper simple para encontrar archivos (como provincias.geojson)
-find_data_file <- function(name, dirs = c("data", "../data", "..")) {
+find_data_file <- function(name, dirs = c("data")) {
   paths <- unique(unlist(lapply(dirs, function(d) file.path(d, name)), use.names = FALSE))
   hits  <- paths[file.exists(paths)]
   if (!length(hits)) {
