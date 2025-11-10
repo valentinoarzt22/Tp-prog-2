@@ -193,7 +193,7 @@ readr::write_csv(dataset_completo, "dataset_clima_unificado.csv")
 
 Primer checkpoint: Para no ejecutar todo lo de arriba
 ```{r}
-dataset_completo <- openRDS("dataset_clima_unificado.Rds")
+dataset_completo <- readRDS("dataset_clima_unificado.Rds")
 ```
 
 # 2. Limpieza de Datos y Tratamiento de NAs
