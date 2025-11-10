@@ -517,8 +517,6 @@ cat("NAs finales restantes:", nas_finales, "\n")
 summary(met_relleno_final)
 ggplot(met_relleno_final, aes(x = PNM)) +
   geom_histogram(binwidth = 0.5)
-ggplot(met_relleno_final, aes(x = PNM_relleno)) +
-  geom_histogram(binwidth = 0.5)
 ggplot(met_relleno_final, aes(x = PNM_relleno_final)) +
   geom_histogram(binwidth = 0.5) 
 # El cambio en la distribucion es apenas perceptible. Me quedo con esta limpieza de NA
