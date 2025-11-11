@@ -14,30 +14,19 @@ Primero, cargamos todas las librerías necesarias para el análisis, incluyendo 
 rm(list = ls())
 options(scipen=999)
 
-library(tidyverse)
-library(slider)
-library("rstudioapi")
-library(arrow)
-library(zoo)
-library(data.table)
-library(janitor)
-library(leaflet)
-library(scales)
-library(prophet)
-library(htmlwidgets)
-library(plotly)
-library(viridisLite)
-library(png)
-if (!requireNamespace("openair", quietly = TRUE)) {
-  install.packages("openair", dependencies = TRUE)
-}
-library(openair)
-library(base64enc)
-library(tibble)   
-library(RColorBrewer)
-library(stringi)
+paquetes_requeridos <- c(
+  "tidyverse", "slider", "rstudioapi", "arrow", "zoo", "data.table", 
+  "janitor", "leaflet", "scales", "prophet", "htmlwidgets", "plotly", 
+  "viridisLite", "png", "openair", "base64enc", "tibble", 
+  "RColorBrewer", "stringi", "openair"
+)
+paquetes_a_instalar <- paquetes_requeridos[!(paquetes_requeridos %in% installed.packages()[,"Package"])]
 
-setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+if (length(paquetes_a_instalar) > 0) {
+  install.packages(paquetes_a_instalar)
+}
+
+lapply(paquetes_requeridos, require, character.only = TRUE)
 ```
 
 No tenemos el dataset completo. Hay que armarlo. Primero empezamos uniendo los archivos de texto, que estan separado por espacios tabulados. Identificamos cada columna con expresiones regulares.  Luego, convertimos las columnas de texto a sus tipos de datos correctos (numérico, fecha) y guardamos el resultado en dataset_clima_unificado.Rds para no tener que repetir este costoso proceso.
@@ -1713,18 +1702,39 @@ clim_doy <- nat_daily %>%
   group_by(doy) %>%
   summarise(clim = mean(value, na.rm = TRUE), .groups = "drop")
 
-# Suavizado tipo SMN (curva negra)
 lo <- loess(clim ~ doy, data = clim_doy, span = 0.25, degree = 2, family = "gaussian")
 clim_doy <- clim_doy %>%
   mutate(clim_smooth = as.numeric(predict(lo, newdata = data.frame(doy = doy))))
+
 
 # --------- 3) Unir serie diaria con la climatología ---------
 plot_df <- nat_daily %>%
   left_join(clim_doy, by = "doy") %>%
   mutate(
     delta = value - clim_smooth,
-    signo = if_else(delta >= 0, "sobre", "bajo")
+    signo = if_else(delta >= 0, "sobre", "bajo"),
+    signo = factor(signo, levels = c("bajo", "sobre")) # --- NUEVO: Asegurarse que 'signo' sea factor
   )
+
+# --- NUEVO: 3b) Calcular agregados mensuales para la nueva vista ---
+monthly_df <- plot_df %>%
+  mutate(month_floor = floor_date(ymd, "month")) %>%
+  group_by(month_floor) %>%
+  summarise(
+    delta_mean = mean(delta, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    signo = if_else(delta_mean >= 0, "sobre", "bajo"),
+    signo = factor(signo, levels = c("bajo", "sobre")) # --- NUEVO: Asegurarse que 'signo' sea factor
+  )
+
+# --- MODIFICADO: Definir rangos de Y para AMBAS vistas ---
+# Rango para la vista diaria (temperaturas)
+y_rng_daily <- range(c(plot_df$value, plot_df$clim_smooth), na.rm = TRUE) + c(-1, 1)
+# Rango para la vista mensual (anomalías)
+y_rng_monthly <- range(monthly_df$delta_mean, na.rm = TRUE) + c(-0.5, 0.5)
+
 
 titulo_var <- if (value_col == "tmax") {
   "Temperatura máxima — Promedio diario nacional"
@@ -1732,45 +1742,73 @@ titulo_var <- if (value_col == "tmax") {
   "Temperatura — Promedio diario nacional"
 }
 
-y_rng <- range(c(plot_df$value, plot_df$clim_smooth), na.rm = TRUE) + c(-1, 1)
-
 # --------- 4) Gráfico (plotly) ---------
-p_anom <- plot_ly(plot_df, x = ~ymd, hoverinfo = "skip") %>%
-  # Barras verticales (como linerange en ggplot)
+p_anom <- plot_ly(hoverinfo = "skip") %>%
+  
+  # --- TRAZA 1: Segmentos diarios (INICIA VISIBLE) ---
   add_segments(
+    data = plot_df,
+    x = ~ymd,
     y = ~pmin(value, clim_smooth),
     yend = ~pmax(value, clim_smooth),
     xend = ~ymd,
     color = ~signo,
     colors = c("bajo" = "#55C3D3", "sobre" = "#C23BAA"),
-    name = "Diferencia",
-    showlegend = FALSE
+    name = "Diferencia Diaria",
+    showlegend = FALSE,
+    visible = TRUE 
   ) %>%
-  # Serie observada
+  
+  # --- TRAZA 2: Línea diaria (INICIA VISIBLE) ---
   add_lines(
+    data = plot_df,
+    x = ~ymd,
     y = ~value,
     name = "Promedio diario nacional",
     line = list(color = "rgba(160,160,160,1)", width = 1),
-    hovertemplate = "%{x|%d-%m-%Y}<br>Promedio: %{y:.1f}°C<extra></extra>"
+    hovertemplate = "%{x|%d-%m-%Y}<br>Promedio: %{y:.1f}°C<extra></extra>",
+    visible = TRUE 
   ) %>%
-  # “Normal” suavizada
+  
+  # --- TRAZA 3: Línea "Normal" (INICIA VISIBLE) ---
   add_lines(
+    data = plot_df,
+    x = ~ymd,
     y = ~clim_smooth,
     name = sprintf("Normal diaria %d–%d (suavizada)", min(norm_years), max(norm_years)),
     line = list(color = "black", width = 2),
-    hovertemplate = "%{x|%d-%m-%Y}<br>Normal: %{y:.1f}°C<extra></extra>"
+    hovertemplate = "%{x|%d-%m-%Y}<br>Normal: %{y:.1f}°C<extra></extra>",
+    visible = TRUE 
   ) %>%
+
+  # --- MODIFICADO: TRAZA 4: Barras mensuales (asegura los colores) ---
+  add_bars(
+    data = monthly_df,
+    x = ~month_floor,
+    y = ~delta_mean,
+    color = ~signo, # Aquí usa la variable factor 'signo'
+    colors = c("bajo" = "#55C3D3", "sobre" = "#C23BAA"), # Y aquí le indicamos los colores explícitamente para cada nivel
+    name = "Anomalía Mensual",
+    hovertemplate = "%{x|%Y-%m}<br>Anomalía: %{y:.1f}°C<extra></extra>",
+    showlegend = FALSE,
+    visible = FALSE
+  ) %>%
+  
+  # --- CORRECCIÓN DEFINITIVA: Layout con 6 trazas ---
   layout(
     title = list(
       text = paste0(
         titulo_var,
         "<br><sup>Argentina — ", format(plot_start, "%Y-%m-%d"),
         " a ", format(plot_end, "%Y-%m-%d"), "</sup>"
-      )
+      ),
+      y = 0.95,
+      x = 0.5,
+      xanchor = 'center'
     ),
     xaxis = list(title = NULL, dtick = "M3", tickformat = "%b %Y"),
-    yaxis = list(title = "Temperatura (°C)", range = y_rng),
-    margin = list(b = 80),
+    yaxis = list(title = "Temperatura (°C)", range = y_rng_daily), 
+    margin = list(b = 80, t = 120),
     annotations = list(
       list(
         text = sprintf(
@@ -1780,10 +1818,66 @@ p_anom <- plot_ly(plot_df, x = ~ymd, hoverinfo = "skip") %>%
         showarrow = FALSE, xref = "paper", yref = "paper",
         x = 1, y = -0.18, xanchor = "right", font = list(size = 10)
       )
+    ),
+    
+    # --- VECTORES DE 6 ELEMENTOS ---
+    updatemenus = list(
+      list(
+        type = "buttons",
+        direction = "right",
+        xanchor = 'center',
+        yanchor = 'top',
+        x = 0.5,
+        y = 1.15, 
+        buttons = list(
+          
+          # Botón 1: Vista Diaria
+          list(
+            method = "update",
+            args = list(
+              # T1(seg-), T2(seg+), T3(val), T4(clim), T5(bar-), T6(bar+)
+              list(visible = c(TRUE, TRUE, TRUE, TRUE, FALSE, FALSE)),
+              list(
+                yaxis = list(title = "Temperatura (°C)", range = y_rng_daily),
+                title = list(
+                  text = paste0(
+                    titulo_var,
+                    "<br><sup>Argentina — ", format(plot_start, "%Y-%m-%d"),
+                    " a ", format(plot_end, "%Y-%m-%d"), "</sup>"
+                  ),
+                  y = 0.95
+                )
+              )
+            ),
+            label = "Vista Diaria"
+          ),
+          
+          # Botón 2: Vista Mensual
+          list(
+            method = "update",
+            args = list(
+              # T1(seg-), T2(seg+), T3(val), T4(clim), T5(bar-), T6(bar+)
+              list(visible = c(FALSE, FALSE, FALSE, FALSE, TRUE, TRUE)),
+              list(
+                yaxis = list(title = "Anomalía Mensual (°C)", range = y_rng_monthly),
+                title = list(
+                  text = paste0(
+                    "Anomalía mensual de la ", tolower(titulo_var), 
+                    "<br><sup>Argentina — ", format(plot_start, "%Y-%m-%d"),
+                    " a ", format(plot_end, "%Y-%m-%d"), "</sup>"
+                  ),
+                  y = 0.95
+                )
+              )
+            ),
+            label = "Vista Mensual"
+          )
+        )
+      )
     )
   )
 
-p_anom
+p_anom # Vuelve a ejecutar p_anom
 # ================== FIN ======================================================
 ```
 

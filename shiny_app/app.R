@@ -1,18 +1,17 @@
 # ==== 1. Cargar Librerías ====
+paquetes_requeridos <- c(
+  "shiny", "shinyWidgets", "bslib", "data.table", "dplyr", "lubridate", 
+  "plotly", "leaflet", "scales", "janitor", "fs", "ggplot2", "sf"
+)
+
+paquetes_a_instalar <- paquetes_requeridos[!(paquetes_requeridos %in% installed.packages()[,"Package"])]
+
+if (length(paquetes_a_instalar) > 0) {
+  install.packages(paquetes_a_instalar)
+}
+
 suppressPackageStartupMessages({
-  library(shiny)
-  library(shinyWidgets) # Para controles más bonitos
-  library(bslib)        # Para la interfaz moderna
-  library(data.table)   # Para manejo rápido de datos
-  library(dplyr)        # Para manipulación de datos
-  library(lubridate)    # Para manejo de fechas
-  library(plotly)       # Para gráficos interactivos
-  library(leaflet)      # Para los mapas
-  library(scales)       # Para escalas en gráficos
-  library(janitor)      # Para limpieza de nombres
-  library(fs)           # Para listar los gráficos estáticos
-  library(ggplot2)      # Para gráficos (aunque usaremos plotly)
-  library(sf)           # GeoJSON
+  lapply(paquetes_requeridos, library, character.only = TRUE)
 })
 
 # ==== 2. Función de Lectura Robusta ====
